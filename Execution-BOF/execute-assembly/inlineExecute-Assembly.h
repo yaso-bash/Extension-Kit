@@ -56,8 +56,8 @@ WINBASEAPI HANDLE WINAPI KERNEL32$GetCurrentProcess(VOID);
 WINBASEAPI VOID WINAPI KERNEL32$GetSystemInfo(LPSYSTEM_INFO lpSystemInfo);
 WINBASEAPI SIZE_T WINAPI KERNEL32$VirtualQuery(LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer, SIZE_T dwLength);
 
-//SHELL32
-WINBASEAPI LPWSTR* WINAPI SHELL32$CommandLineToArgvW(LPCWSTR lpCmdLine, int* pNumArgs);
+//SHELL32 - resolved dynamically to avoid BOF loader import failures
+typedef LPWSTR* (WINAPI *fnCommandLineToArgvW)(LPCWSTR lpCmdLine, int* pNumArgs);
 //MSCOREE
 WINBASEAPI HRESULT WINAPI MSCOREE$CLRCreateInstance(REFCLSID clsid, REFIID riid, LPVOID* ppInterface);
 //OLEAUT32

@@ -9,6 +9,27 @@
 #include "utils.c"
 #include "apisetlookup.c"
 
+#pragma push_macro("memset")
+#pragma push_macro("memcpy")
+#undef memset
+#undef memcpy
+
+void *memset(void *dest, int c, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    while (n--) *d++ = (unsigned char)c;
+    return dest;
+}
+
+void *memcpy(void *dest, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) *d++ = *s++;
+    return dest;
+}
+
+#pragma pop_macro("memset")
+#pragma pop_macro("memcpy")
+
 int go(IN PCHAR Buffer, IN ULONG Length)
 {
     datap           parser        = { 0 };
