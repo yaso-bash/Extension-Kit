@@ -13,6 +13,7 @@ cmd_hollow.addArgFlagString("--spawnto",   "SPAWN_TO",  false, "Sacrificial proc
 cmd_hollow.addArgFlagInt("--timeout",      "SECONDS",   false, "Timeout in seconds for output capture (default: 60)");
 cmd_hollow.addArgBool("-no",                                    "Do not capture output (fire and forget)");
 cmd_hollow.addArgBool("--no-blockdlls",                         "Disable BlockDLLs mitigation policy");
+cmd_hollow.addArgBool("--no-ppid",                              "Disable PPID spoofing");
 cmd_hollow.addArgBool("--async",                                "Run BOF asynchronously");
 
 cmd_hollow.setPreHook(function(id, cmdline, parsed_json, ...parsed_lines) {
@@ -51,13 +52,14 @@ cmd_hollow.setPreHook(function(id, cmdline, parsed_json, ...parsed_lines) {
     let noOutput = parsed_json["-no"] ? 1 : 0;
     let timeout  = ("SECONDS" in parsed_json) ? parsed_json["SECONDS"] * 1000 : 60000;
     let blockDlls = parsed_json["--no-blockdlls"] ? 0 : 1;
+    let noPpid   = parsed_json["--no-ppid"] ? 1 : 0;
     let spawnto  = ("SPAWN_TO" in parsed_json) ? parsed_json["SPAWN_TO"] : "";
     let args     = ("ARGS" in parsed_json) ? parsed_json["ARGS"] : "";
     let async    = parsed_json["--async"] ? "-a " : "";
 
     let bof_params = ax.bof_pack(
-        "int,int,int,int,int,cstr,cstr,cstr,bytes",
-        [mode, source, noOutput, timeout, blockDlls, spawnto, args, localPath, payloadBytes]
+        "int,int,int,int,int,int,cstr,cstr,cstr,bytes",
+        [mode, source, noOutput, timeout, blockDlls, noPpid, spawnto, args, localPath, payloadBytes]
     );
 
     let bof_path = ax.script_dir() + "_bin/hollow." + ax.arch(id) + ".o";

