@@ -4,6 +4,7 @@ var metadata = {
 };
 
 ax.script_import(ax.script_dir() + "No-Consolation/no_consolation.axs")
+ax.script_import(ax.script_dir() + "hollow/hollow.axs")
 
 
 
@@ -27,5 +28,5 @@ cmd_execute_assembly.setPreHook(function (id, cmdline, parsed_json, ...parsed_li
     ax.execute_alias(id, cmdline, `execute bof ${async}"${bof_path}" ${bof_params}`, "Task: execute .NET assembly");
 });
 
-var group_exec = ax.create_commands_group("Execution-BOF", [cmd_execute_assembly, cmd_no_consolation]);
+var group_exec = ax.create_commands_group("Execution-BOF", [cmd_execute_assembly, cmd_no_consolation, cmd_hollow]);
 ax.register_commands_group(group_exec, ["beacon", "gopher", "kharon"], ["windows"], []);
