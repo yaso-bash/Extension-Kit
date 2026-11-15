@@ -13,6 +13,12 @@
 #include "pipe.h"
 #endif
 
+#if defined(BOF) && defined(_M_IX86)
+DECLSPEC_IMPORT NTSTATUS NTAPI NTDLL$NtClose(HANDLE);
+#undef NtClose
+#define NtClose NTDLL$NtClose
+#endif
+
 typedef NTSTATUS(WINAPI* AddSecurityPackageW_t) (LPWSTR pszPackageName, PSECURITY_PACKAGE_OPTIONS pOptions);
 typedef HANDLE(WINAPI* CreateThread_t)(LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId);
 

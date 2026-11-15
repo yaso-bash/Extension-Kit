@@ -4,6 +4,7 @@
 #include "syscalls.h"
 #include "adaptix.h"
 
+
 #ifndef SSP
 
 BOOL print_shtinkering_crash_location(VOID)

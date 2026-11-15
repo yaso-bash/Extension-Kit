@@ -1,6 +1,7 @@
 #include "ssp/ssp.h"
 #include "ssp/ssp_utils.h"
 
+
 DWORD WINAPI load_ssp(LPVOID Parameter)
 {
     LPSTR ssp_path = (LPSTR)Parameter;
@@ -194,6 +195,11 @@ cleanup:
 #include "../dinvoke.c"
 #if PASS_PARAMS_VIA_NAMED_PIPES == 1
 #include "../pipe.c"
+#endif
+
+#ifdef _M_IX86
+#undef NtClose
+#define NtClose NTDLL$NtClose
 #endif
 
 void go(char* args, int length)
