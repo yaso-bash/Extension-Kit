@@ -3,6 +3,11 @@ CC64 = x86_64-w64-mingw32-gcc
 STRIP64 = x86_64-w64-mingw32-strip --strip-unneeded
 CFLAGS = -I ../_include -Os -masm=intel -DBOF -c
 
+CC32 = i686-w64-mingw32-gcc
+STRIP32 = i686-w64-mingw32-strip --strip-unneeded 
+
+
+
 all: bof
 
 bof: clean
@@ -11,6 +16,7 @@ bof: clean
 	@($(CC64) $(CFLAGS) ldapsearch/ldapsearch.c -o _bin/ldapsearch.x64.o && $(STRIP64) _bin/ldapsearch.x64.o) && echo '[+] ldapsearch' || echo '[!] ldapsearch'
 	@($(CC64) $(CFLAGS) adwssearch/adws_search.c -o _bin/adws_search.x64.o && $(STRIP64) _bin/adws_search.x64.o) && echo '[+] adws_search' || echo '[!] adws_search'
 	@($(CC64) $(CFLAGS) readlaps/readlaps.c -o _bin/readlaps.x64.o && $(STRIP64) _bin/readlaps.x64.o) && echo '[+] readlaps' || echo '[!] readlaps'
+	@($(CC32) $(CFLAGS) readlaps/readlaps.c -o _bin/readlaps.x32.o && $(STRIP32) _bin/readlaps.x32.o) && echo '[+] readlaps x32' || echo '[!] readlaps x32' 
 	@($(CC64) $(CFLAGS) WebDAVClient/EnableWebDAVClient.c -o _bin/webdav_enable.x64.o && $(STRIP64) _bin/webdav_enable.x64.o) && echo '[+] webdav_enable' || echo '[!] webdav_enable'
 	@($(CC64) $(CFLAGS) WebDAVClient/StatusWebDAVClient.c -o _bin/webdav_status.x64.o && $(STRIP64) _bin/webdav_status.x64.o) && echo '[+] webdav_status' || echo '[!] webdav_status'
 	@ # x86: -DWOW64 -fno-leading-underscore

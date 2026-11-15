@@ -251,110 +251,110 @@ void END_BOF() {
 }
 
 BOOL LoadFunc() {
-    HMODULE crypt = GetModuleHandleA("CRYPTDLL");
-    if (!crypt) crypt = LoadLibraryA("CRYPTDLL");
+    HMODULE crypt = KERNEL32$GetModuleHandleA("CRYPTDLL");
+    if (!crypt) crypt = KERNEL32$LoadLibraryA("CRYPTDLL");
     if (!crypt) {
         PRINT_OUT("[x] Failed to load CRYPTDLL module\n");
         goto failed;
     }
 
-    CDLocateCheckSum = GetProcAddress(crypt, "CDLocateCheckSum");
+    CDLocateCheckSum = KERNEL32$GetProcAddress(crypt, "CDLocateCheckSum");
     if (!CDLocateCheckSum) goto failed;
 
-    CDLocateCSystem = GetProcAddress(crypt, "CDLocateCSystem");
+    CDLocateCSystem = KERNEL32$GetProcAddress(crypt, "CDLocateCSystem");
     if (!CDLocateCSystem) goto failed;
 
 
 
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    HMODULE ntdll = KERNEL32$GetModuleHandleA("ntdll.dll");
     if (!ntdll) goto failed;
 
-    RtlAnsiStringToUnicodeString = GetProcAddress(ntdll, "RtlAnsiStringToUnicodeString");
+    RtlAnsiStringToUnicodeString = KERNEL32$GetProcAddress(ntdll, "RtlAnsiStringToUnicodeString");
     if (!RtlAnsiStringToUnicodeString) goto failed;
 
-    RtlInitUnicodeString = GetProcAddress(ntdll, "RtlInitUnicodeString");
+    RtlInitUnicodeString = KERNEL32$GetProcAddress(ntdll, "RtlInitUnicodeString");
     if (!RtlInitUnicodeString) goto failed;
 
-    RtlInitAnsiString = GetProcAddress(ntdll, "RtlInitAnsiString");
+    RtlInitAnsiString = KERNEL32$GetProcAddress(ntdll, "RtlInitAnsiString");
     if (!RtlInitAnsiString) goto failed;
 
 
 
 
-    HMODULE advapi = GetModuleHandleA("ADVAPI32");
+    HMODULE advapi = KERNEL32$GetModuleHandleA("ADVAPI32");
     if (!advapi)
-        advapi = LoadLibraryA("ADVAPI32");
+        advapi = KERNEL32$LoadLibraryA("ADVAPI32");
     if (!advapi) {
         PRINT_OUT("[x] Failed to load ADVAPI32 module\n");
         goto failed;
     }
 
-    ADVAPI32$ConvertSidToStringSidA = GetProcAddress(advapi, "ConvertSidToStringSidA");
+    ADVAPI32$ConvertSidToStringSidA = KERNEL32$GetProcAddress(advapi, "ConvertSidToStringSidA");
     if (!ADVAPI32$ConvertSidToStringSidA) goto failed;
 
-    ADVAPI32$SystemFunction036 = GetProcAddress(advapi, "SystemFunction036");
+    ADVAPI32$SystemFunction036 = KERNEL32$GetProcAddress(advapi, "SystemFunction036");
     if (!ADVAPI32$SystemFunction036) goto failed;
 
-    ADVAPI32$GetTokenInformation = GetProcAddress(advapi, "GetTokenInformation");
+    ADVAPI32$GetTokenInformation = KERNEL32$GetProcAddress(advapi, "GetTokenInformation");
     if (!ADVAPI32$GetTokenInformation) goto failed;
 
-    ADVAPI32$OpenThreadToken = GetProcAddress(advapi, "OpenThreadToken");
+    ADVAPI32$OpenThreadToken = KERNEL32$GetProcAddress(advapi, "OpenThreadToken");
     if (!ADVAPI32$OpenThreadToken) goto failed;
 
-    ADVAPI32$OpenProcessToken = GetProcAddress(advapi, "OpenProcessToken");
+    ADVAPI32$OpenProcessToken = KERNEL32$GetProcAddress(advapi, "OpenProcessToken");
     if (!ADVAPI32$OpenProcessToken) goto failed;
 
-    ADVAPI32$AllocateAndInitializeSid = GetProcAddress(advapi, "AllocateAndInitializeSid");
+    ADVAPI32$AllocateAndInitializeSid = KERNEL32$GetProcAddress(advapi, "AllocateAndInitializeSid");
     if (!ADVAPI32$AllocateAndInitializeSid) goto failed;
 
-    ADVAPI32$EqualSid = GetProcAddress(advapi, "EqualSid");
+    ADVAPI32$EqualSid = KERNEL32$GetProcAddress(advapi, "EqualSid");
     if (!ADVAPI32$EqualSid) goto failed;
 
-    ADVAPI32$FreeSid = GetProcAddress(advapi, "FreeSid");
+    ADVAPI32$FreeSid = KERNEL32$GetProcAddress(advapi, "FreeSid");
     if (!ADVAPI32$FreeSid) goto failed;
 
-    HMODULE secur32 = GetModuleHandleA("SECUR32");
+    HMODULE secur32 = KERNEL32$GetModuleHandleA("SECUR32");
     if (!secur32)
-        secur32 = LoadLibraryA("SECUR32");
+        secur32 = KERNEL32$LoadLibraryA("SECUR32");
     if (!secur32) {
         PRINT_OUT("[x] Failed to load SECUR32 module\n");
         goto failed;
     }
 
-    SECUR32$LsaConnectUntrusted = GetProcAddress(secur32, "LsaConnectUntrusted");
+    SECUR32$LsaConnectUntrusted = KERNEL32$GetProcAddress(secur32, "LsaConnectUntrusted");
     if (!SECUR32$LsaConnectUntrusted) goto failed;
 
-    SECUR32$LsaRegisterLogonProcess = GetProcAddress(secur32, "LsaRegisterLogonProcess");
+    SECUR32$LsaRegisterLogonProcess = KERNEL32$GetProcAddress(secur32, "LsaRegisterLogonProcess");
     if (!SECUR32$LsaRegisterLogonProcess) goto failed;
 
-    SECUR32$LsaGetLogonSessionData = GetProcAddress(secur32, "LsaGetLogonSessionData");
+    SECUR32$LsaGetLogonSessionData = KERNEL32$GetProcAddress(secur32, "LsaGetLogonSessionData");
     if (!SECUR32$LsaGetLogonSessionData) goto failed;
 
-    SECUR32$LsaEnumerateLogonSessions = GetProcAddress(secur32, "LsaEnumerateLogonSessions");
+    SECUR32$LsaEnumerateLogonSessions = KERNEL32$GetProcAddress(secur32, "LsaEnumerateLogonSessions");
     if (!SECUR32$LsaEnumerateLogonSessions) goto failed;
 
-    SECUR32$LsaFreeReturnBuffer = GetProcAddress(secur32, "LsaFreeReturnBuffer");
+    SECUR32$LsaFreeReturnBuffer = KERNEL32$GetProcAddress(secur32, "LsaFreeReturnBuffer");
     if (!SECUR32$LsaFreeReturnBuffer) goto failed;
 
-    SECUR32$LsaCallAuthenticationPackage = GetProcAddress(secur32, "LsaCallAuthenticationPackage");
+    SECUR32$LsaCallAuthenticationPackage = KERNEL32$GetProcAddress(secur32, "LsaCallAuthenticationPackage");
     if (!SECUR32$LsaCallAuthenticationPackage) goto failed;
 
-    SECUR32$LsaDeregisterLogonProcess = GetProcAddress(secur32, "LsaDeregisterLogonProcess");
+    SECUR32$LsaDeregisterLogonProcess = KERNEL32$GetProcAddress(secur32, "LsaDeregisterLogonProcess");
     if (!SECUR32$LsaDeregisterLogonProcess) goto failed;
 
-    SECUR32$LsaLookupAuthenticationPackage = GetProcAddress(secur32, "LsaLookupAuthenticationPackage");
+    SECUR32$LsaLookupAuthenticationPackage = KERNEL32$GetProcAddress(secur32, "LsaLookupAuthenticationPackage");
     if (!SECUR32$LsaLookupAuthenticationPackage) goto failed;
 
-    SECUR32$InitializeSecurityContextA = GetProcAddress(secur32, "InitializeSecurityContextA");
+    SECUR32$InitializeSecurityContextA = KERNEL32$GetProcAddress(secur32, "InitializeSecurityContextA");
     if (!SECUR32$InitializeSecurityContextA) goto failed;
 
-    SECUR32$DeleteSecurityContext = GetProcAddress(secur32, "DeleteSecurityContext");
+    SECUR32$DeleteSecurityContext = KERNEL32$GetProcAddress(secur32, "DeleteSecurityContext");
     if (!SECUR32$DeleteSecurityContext) goto failed;
 
-    SECUR32$FreeCredentialsHandle = GetProcAddress(secur32, "FreeCredentialsHandle");
+    SECUR32$FreeCredentialsHandle = KERNEL32$GetProcAddress(secur32, "FreeCredentialsHandle");
     if (!SECUR32$FreeCredentialsHandle) goto failed;
 
-    SECUR32$AcquireCredentialsHandleA = GetProcAddress(secur32, "AcquireCredentialsHandleA");
+    SECUR32$AcquireCredentialsHandleA = KERNEL32$GetProcAddress(secur32, "AcquireCredentialsHandleA");
     if ( !SECUR32$AcquireCredentialsHandleA) goto failed;
 
     MEMORY_BANK = KERNEL32$VirtualAlloc(NULL, sizeof(void*) * 0x1000, MEM_COMMIT, PAGE_READWRITE);

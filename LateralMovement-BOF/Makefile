@@ -25,8 +25,8 @@ bof: clean
 	@($(CC86) $(CFLAGS) token_make/token_make.c    -o _bin/token_make.x32.o  && $(STRIP86) _bin/token_make.x32.o)  && echo '[+] token_make (x32)'  || echo '[!] token_make (x32)'
 	@($(CC86) $(CFLAGS) token_steal/token_steal.c  -o _bin/token_steal.x32.o && $(STRIP86) _bin/token_steal.x32.o) && echo '[+] token_steal (x32)' || echo '[!] token_steal (x32)'
 	@($(CC86) $(CFLAGS) runas/runas.c              -o _bin/runas.x32.o       && $(STRIP86) _bin/runas.x32.o)       && echo '[+] runas (x32)'       || echo '[!] runas (x32)'
-	@#($(CC64) $(CFLAGS) runas_sess_IHxExec/ihxexec.c -o _bin/runas_sess_ihxexec.x64.o && $(STRIP64) _bin/runas_sess_ihxexec.x64.o) && echo '[+] runas_sess_ihxexec' || echo '[!] runas_sess_ihxexec'
-	@#($(CPP86) -I ../_include -w -Os -s -c -masm=intel -nostdlib -Wno-nonnull -fno-asynchronous-unwind-tables -fno-exceptions -fno-rtti winrm-client/winrm.cpp -o _bin/winrm.x32.o && $(STRIP86) _bin/winrm.x32.o) && echo '[+] winrm (x32)' || echo '[!] winrm (x32)'
+	@($(CC86) $(CFLAGS) runas_sess_IHxExec/ihxexec.c -o _bin/runas_sess_ihxexec.x32.o && $(STRIP86) _bin/runas_sess_ihxexec.x32.o) && echo '[+] runas_sess_ihxexec (x32)' || echo '[!] runas_sess_ihxexec (x32)'
+	@($(CPP86) -I ../_include -w -Os -s -c -masm=intel -nostdlib -Wno-nonnull -fno-asynchronous-unwind-tables -fno-exceptions -fno-rtti winrm-client/winrm.cpp -o _bin/winrm.x32.o && $(STRIP86) _bin/winrm.x32.o) && echo '[+] winrm (x32)' || echo '[!] winrm (x32)'
 
 clean:
 	@(rm -rf _bin)

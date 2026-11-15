@@ -131,7 +131,7 @@ FARPROC DynamicLoad(const char * szLibrary, const char * szFunction)
     }
     if(!hMod)
     {
-        hMod = LoadLibraryA(szLibrary);
+        hMod = KERNEL32$LoadLibraryA(szLibrary);
         if(!hMod){ 
             BeaconPrintf(CALLBACK_ERROR, "*** DynamicLoad(%s) FAILED!\nCould not find library to load.", szLibrary);
             return NULL;
@@ -140,7 +140,7 @@ FARPROC DynamicLoad(const char * szLibrary, const char * szFunction)
         loadedLibraries[loadedLibrariesCount].name = szLibrary; //And this is why this HAS to be a constant or not freed before bofstop
         loadedLibrariesCount++;
     }
-    fp = GetProcAddress(hMod, szFunction);
+    fp = KERNEL32$GetProcAddress(hMod, szFunction);
 
     if (NULL == fp)
     {
@@ -200,7 +200,7 @@ void bofstop()
     DWORD i;
     for(i = 0; i < loadedLibrariesCount; i++)
     {
-        FreeLibrary(loadedLibraries[i].hMod);
+        KERNEL32$FreeLibrary(loadedLibraries[i].hMod);
     }
 #endif
 	return;

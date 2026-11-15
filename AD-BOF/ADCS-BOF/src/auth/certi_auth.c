@@ -11,6 +11,11 @@
 #include <lm.h>
 
 #include "beacon.h"
+
+DECLSPEC_IMPORT HMODULE WINAPI KERNEL32$LoadLibraryA(LPCSTR);
+DECLSPEC_IMPORT FARPROC WINAPI KERNEL32$GetProcAddress(HMODULE, LPCSTR);
+DECLSPEC_IMPORT BOOL WINAPI KERNEL32$FreeLibrary(HMODULE);
+
 #define CALLBACK_OUTPUT 0x0
 #define CALLBACK_ERROR 0x0d
 
@@ -167,9 +172,9 @@ DECLSPEC_IMPORT DWORD WINAPI NETAPI32$NetApiBufferFree(LPVOID);
 /* Kernel32 */
 DECLSPEC_IMPORT HLOCAL WINAPI KERNEL32$LocalAlloc(UINT, SIZE_T);
 DECLSPEC_IMPORT HLOCAL WINAPI KERNEL32$LocalFree(HLOCAL);
-DECLSPEC_IMPORT HMODULE WINAPI KERNEL32$LoadLibraryA(LPCSTR);
-DECLSPEC_IMPORT FARPROC WINAPI KERNEL32$GetProcAddress(HMODULE, LPCSTR);
-DECLSPEC_IMPORT BOOL WINAPI KERNEL32$FreeLibrary(HMODULE);
+DECLSPEC_IMPORT HMODULE WINAPI KERNEL32$KERNEL32$LoadLibraryA(LPCSTR);
+DECLSPEC_IMPORT FARPROC WINAPI KERNEL32$KERNEL32$GetProcAddress(HMODULE, LPCSTR);
+DECLSPEC_IMPORT BOOL WINAPI KERNEL32$KERNEL32$FreeLibrary(HMODULE);
 DECLSPEC_IMPORT int WINAPI KERNEL32$MultiByteToWideChar(UINT, DWORD, LPCCH, int, LPWSTR, int);
 DECLSPEC_IMPORT int WINAPI KERNEL32$WideCharToMultiByte(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
 DECLSPEC_IMPORT void WINAPI KERNEL32$GetSystemTime(LPSYSTEMTIME);
@@ -1534,23 +1539,23 @@ static BYTE* KerberosDecrypt(int eType, int keyUsage, BYTE* key, int keyLen,
     BYTE* output = NULL;
     int status;
 
-    hCryptDll = LoadLibraryA("cryptdll.dll");
+    hCryptDll = KERNEL32$LoadLibraryA("cryptdll.dll");
     if (!hCryptDll) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Failed to load cryptdll.dll");
         return NULL;
     }
 
-    pCDLocateCSystem = (CDLocateCSystem_t)GetProcAddress(hCryptDll, "CDLocateCSystem");
+    pCDLocateCSystem = (CDLocateCSystem_t)KERNEL32$GetProcAddress(hCryptDll, "CDLocateCSystem");
     if (!pCDLocateCSystem) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Failed to find CDLocateCSystem");
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
     status = pCDLocateCSystem(eType, (void**)&pCSystem);
     if (status != 0 || !pCSystem) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] CDLocateCSystem failed: 0x%X", status);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
@@ -1563,7 +1568,7 @@ static BYTE* KerberosDecrypt(int eType, int keyUsage, BYTE* key, int keyLen,
     status = initFunc(key, keyLen, keyUsage, &pContext);
     if (status != 0) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Decrypt Initialize failed: 0x%X", status);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
@@ -1583,12 +1588,12 @@ static BYTE* KerberosDecrypt(int eType, int keyUsage, BYTE* key, int keyLen,
     if (status != 0) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Decrypt failed: 0x%X", status);
         free(output);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
     *outLen = outputSize;
-    FreeLibrary(hCryptDll);
+    KERNEL32$FreeLibrary(hCryptDll);
     return output;
 }
 
@@ -1609,23 +1614,23 @@ static BYTE* KerberosEncrypt(int eType, int keyUsage, BYTE* key, int keyLen,
     BYTE* output = NULL;
     int status;
 
-    hCryptDll = LoadLibraryA("cryptdll.dll");
+    hCryptDll = KERNEL32$LoadLibraryA("cryptdll.dll");
     if (!hCryptDll) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Failed to load cryptdll.dll for encrypt");
         return NULL;
     }
 
-    pCDLocateCSystem = (CDLocateCSystem_t)GetProcAddress(hCryptDll, "CDLocateCSystem");
+    pCDLocateCSystem = (CDLocateCSystem_t)KERNEL32$GetProcAddress(hCryptDll, "CDLocateCSystem");
     if (!pCDLocateCSystem) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Failed to find CDLocateCSystem");
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
     status = pCDLocateCSystem(eType, (void**)&pCSystem);
     if (status != 0 || !pCSystem) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] CDLocateCSystem failed for encrypt: 0x%X", status);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
@@ -1638,7 +1643,7 @@ static BYTE* KerberosEncrypt(int eType, int keyUsage, BYTE* key, int keyLen,
     status = initFunc(key, keyLen, keyUsage, &pContext);
     if (status != 0) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Encrypt Initialize failed: 0x%X", status);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
@@ -1653,12 +1658,12 @@ static BYTE* KerberosEncrypt(int eType, int keyUsage, BYTE* key, int keyLen,
     if (status != 0) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Encrypt failed: 0x%X", status);
         free(output);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
     *outLen = outputSize;
-    FreeLibrary(hCryptDll);
+    KERNEL32$FreeLibrary(hCryptDll);
     return output;
 }
 
@@ -1695,23 +1700,23 @@ static BYTE* ComputeKerberosChecksum(BYTE* key, int keyLen, BYTE* data, int data
     BYTE* output = NULL;
     int status;
 
-    hCryptDll = LoadLibraryA("cryptdll.dll");
+    hCryptDll = KERNEL32$LoadLibraryA("cryptdll.dll");
     if (!hCryptDll) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Failed to load cryptdll.dll for checksum");
         return NULL;
     }
 
-    pCDLocateCheckSum = (CDLocateCheckSum_t)GetProcAddress(hCryptDll, "CDLocateCheckSum");
+    pCDLocateCheckSum = (CDLocateCheckSum_t)KERNEL32$GetProcAddress(hCryptDll, "CDLocateCheckSum");
     if (!pCDLocateCheckSum) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Failed to find CDLocateCheckSum");
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
     status = pCDLocateCheckSum(KERB_CHECKSUM_HMAC_SHA1_96_AES256, (void**)&pCheckSum);
     if (status != 0 || !pCheckSum) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] CDLocateCheckSum failed: 0x%X", status);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
@@ -1725,7 +1730,7 @@ static BYTE* ComputeKerberosChecksum(BYTE* key, int keyLen, BYTE* data, int data
     status = initExFunc(key, keyLen, keyUsage, &pContext);
     if (status != 0) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Checksum InitializeEx failed: 0x%X", status);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
@@ -1734,7 +1739,7 @@ static BYTE* ComputeKerberosChecksum(BYTE* key, int keyLen, BYTE* data, int data
     if (status != 0) {
         finishFunc(&pContext);
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Checksum Sum failed: 0x%X", status);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
@@ -1747,11 +1752,11 @@ static BYTE* ComputeKerberosChecksum(BYTE* key, int keyLen, BYTE* data, int data
     if (status != 0) {
         BeaconPrintf(CALLBACK_OUTPUT, "[!] Checksum Finalize failed: 0x%X", status);
         free(output);
-        FreeLibrary(hCryptDll);
+        KERNEL32$FreeLibrary(hCryptDll);
         return NULL;
     }
 
-    FreeLibrary(hCryptDll);
+    KERNEL32$FreeLibrary(hCryptDll);
     return output;
 }
 

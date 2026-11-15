@@ -59,7 +59,7 @@ WINBASEAPI DWORD  WINAPI WsmSvc$WSManCloseOperation(WSMAN_OPERATION_HANDLE opera
         BOOL commandDone;
     } ctxCallback, *PCtxCallback;
 
-    void WSManShellCompletionFunction( PVOID operationContext, DWORD flags, WSMAN_ERROR* error, WSMAN_SHELL_HANDLE shell, WSMAN_COMMAND_HANDLE command, WSMAN_OPERATION_HANDLE operationHandle, WSMAN_RECEIVE_DATA_RESULT* data )
+    void CALLBACK WSManShellCompletionFunction( PVOID operationContext, DWORD flags, WSMAN_ERROR* error, WSMAN_SHELL_HANDLE shell, WSMAN_COMMAND_HANDLE command, WSMAN_OPERATION_HANDLE operationHandle, WSMAN_RECEIVE_DATA_RESULT* data )
     {
         if (operationContext == NULL) {
             BeaconPrintf(CALLBACK_ERROR, "no context was passed to WSManShellCompletionFunction\n");
@@ -73,7 +73,7 @@ WINBASEAPI DWORD  WINAPI WsmSvc$WSManCloseOperation(WSMAN_OPERATION_HANDLE opera
         SetEvent(ctxOperation->event);
     }
 
-    void ReceiveCallback( PVOID operationContext, DWORD flags, WSMAN_ERROR* error, WSMAN_SHELL_HANDLE shell, WSMAN_COMMAND_HANDLE command, WSMAN_OPERATION_HANDLE operationHandle, WSMAN_RECEIVE_DATA_RESULT* data )
+    void CALLBACK ReceiveCallback( PVOID operationContext, DWORD flags, WSMAN_ERROR* error, WSMAN_SHELL_HANDLE shell, WSMAN_COMMAND_HANDLE command, WSMAN_OPERATION_HANDLE operationHandle, WSMAN_RECEIVE_DATA_RESULT* data )
     {
         if (operationContext == NULL) {
             BeaconPrintf(CALLBACK_ERROR, "no context was passed to WSManRunShellCommand");

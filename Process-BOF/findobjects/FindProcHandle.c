@@ -10,6 +10,9 @@
 #include "FindObjects.h"
 #include "beacon.h"
 
+DECLSPEC_IMPORT HMODULE WINAPI KERNEL32$GetModuleHandleA(LPCSTR);
+DECLSPEC_IMPORT FARPROC WINAPI KERNEL32$GetProcAddress(HMODULE, LPCSTR);
+
 INT iGarbage = 1;
 LPSTREAM lpStream = (LPSTREAM)1;
 
@@ -88,7 +91,7 @@ BOOL IsElevated() {
 	HANDLE hToken = NULL;
 
 	_NtOpenProcessToken NtOpenProcessToken = (_NtOpenProcessToken)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
 	if (NtOpenProcessToken == NULL) {
 		return FALSE;
 	}
@@ -116,7 +119,7 @@ BOOL SetDebugPrivilege() {
 	TOKEN_PRIVILEGES TokenPrivileges = { 0 };
 
 	_NtOpenProcessToken NtOpenProcessToken = (_NtOpenProcessToken)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
 	if (NtOpenProcessToken == NULL) {
 		return FALSE;
 	}
@@ -169,13 +172,13 @@ ULONG GetPid(LPCWSTR lpwProcName) {
 	ULONG uReturnLength = 0;
 
 	_RtlInitUnicodeString RtlInitUnicodeString = (_RtlInitUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
 	if (RtlInitUnicodeString == NULL) {
 		return 0;
 	}
 
 	_RtlEqualUnicodeString RtlEqualUnicodeString = (_RtlEqualUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
 	if (RtlEqualUnicodeString == NULL) {
 		return 0;
 	}
@@ -231,13 +234,13 @@ BOOL EnumObjectHandles(HANDLE hProcess, PSYSTEM_HANDLE pObjHandle, LPCWSTR lpwHa
 	ULONG uReturnLength = 0;
 
 	_RtlInitUnicodeString RtlInitUnicodeString = (_RtlInitUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
 	if (RtlInitUnicodeString == NULL) {
 		return FALSE;
 	}
 
 	_RtlEqualUnicodeString RtlEqualUnicodeString = (_RtlEqualUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
 	if (RtlEqualUnicodeString == NULL) {
 		return FALSE;
 	}
@@ -327,13 +330,13 @@ VOID go(IN PCHAR Args, IN ULONG Length)
 	}
 
 	_RtlInitUnicodeString RtlInitUnicodeString = (_RtlInitUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
 	if (RtlInitUnicodeString == NULL) {
 		return;
 	}
 
 	_RtlEqualUnicodeString RtlEqualUnicodeString = (_RtlEqualUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
 	if (RtlEqualUnicodeString == NULL) {
 		return;
 	}

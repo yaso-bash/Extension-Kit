@@ -142,7 +142,7 @@ BOOL IsElevated() {
 	HANDLE hToken = NULL;
 
 	_NtOpenProcessToken NtOpenProcessToken = (_NtOpenProcessToken)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
 	if (NtOpenProcessToken == NULL) {
 		return FALSE;
 	}
@@ -170,7 +170,7 @@ BOOL SetDebugPrivilege() {
 	TOKEN_PRIVILEGES TokenPrivileges = { 0 };
 
 	_NtOpenProcessToken NtOpenProcessToken = (_NtOpenProcessToken)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
 	if (NtOpenProcessToken == NULL) {
 		return FALSE;
 	}
@@ -211,7 +211,7 @@ LPWSTR GetProcessUser(_In_ HANDLE hProcess, _In_ BOOL bCloseHandle, _In_ BOOL bR
 	SID_NAME_USE SidType;
 
 	_NtOpenProcessToken NtOpenProcessToken = (_NtOpenProcessToken)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
 	if (NtOpenProcessToken == NULL) {
 		return NULL;
 	}
@@ -274,19 +274,19 @@ DWORD IntegrityLevel(_In_ HANDLE hProcess) {
 	DWORD dwRet = 0;
 
 	_NtOpenProcessToken NtOpenProcessToken = (_NtOpenProcessToken)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtOpenProcessToken");
 	if (NtOpenProcessToken == NULL) {
 		return 0;
 	}
 	
 	_RtlSubAuthoritySid RtlSubAuthoritySid = (_RtlSubAuthoritySid)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlSubAuthoritySid");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlSubAuthoritySid");
 	if (RtlSubAuthoritySid == NULL) {
 		return 0;
 	}
 
 	_RtlSubAuthorityCountSid RtlSubAuthorityCountSid = (_RtlSubAuthorityCountSid)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlSubAuthorityCountSid");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlSubAuthorityCountSid");
 	if (RtlSubAuthorityCountSid == NULL) {
 		return 0;
 	}
@@ -402,13 +402,13 @@ BOOL EnumPebFromWoW64(_In_ HANDLE hProcess) {
 	RTL_USER_PROCESS_PARAMETERS64 upp64 = { 0 };
 
 	_NtWow64QueryInformationProcess64 NtWow64QueryInformationProcess64 = (_NtWow64QueryInformationProcess64)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWow64QueryInformationProcess64");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtWow64QueryInformationProcess64");
 	if (NtWow64QueryInformationProcess64 == NULL) {
 		return FALSE;
 	}
 
 	_NtWow64ReadVirtualMemory64 NtWow64ReadVirtualMemory64 = (_NtWow64ReadVirtualMemory64)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWow64ReadVirtualMemory64");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "NtWow64ReadVirtualMemory64");
 	if (NtWow64ReadVirtualMemory64 == NULL) {
 		return FALSE;
 	}
@@ -636,21 +636,21 @@ BOOL EnumKernel() {
 	UNICODE_STRING uKernelImage;
 
 	_RtlInitAnsiString RtlInitAnsiString = (_RtlInitAnsiString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlInitAnsiString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlInitAnsiString");
 	if (RtlInitAnsiString == NULL) {
         BeaconPrintf(CALLBACK_ERROR, "GetProcAddress failed.\n");
 		return FALSE;
 	}
 
 	_RtlAnsiStringToUnicodeString RtlAnsiStringToUnicodeString = (_RtlAnsiStringToUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlAnsiStringToUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlAnsiStringToUnicodeString");
 	if (RtlAnsiStringToUnicodeString == NULL) {
         BeaconPrintf(CALLBACK_ERROR, "GetProcAddress failed.\n");
 		return FALSE;
 	}
 
 	_RtlFreeUnicodeString RtlFreeUnicodeString = (_RtlFreeUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlFreeUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlFreeUnicodeString");
 	if (RtlFreeUnicodeString == NULL) {
         BeaconPrintf(CALLBACK_ERROR, "GetProcAddress failed.\n");
 		return FALSE;
@@ -927,7 +927,7 @@ BOOL GetTcpSessions(_In_ DWORD ProcessId, _Out_ BOOL *bRDPEnabled) {
 					internal_printf("%-18s%s\n", "    State:", "ESTABLISHED");
 					
 					_RtlIpv4AddressToStringW RtlIpv4AddressToStringW = (_RtlIpv4AddressToStringW)
-						GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlIpv4AddressToStringW");
+						KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlIpv4AddressToStringW");
 					if (RtlIpv4AddressToStringW == NULL) {
 						goto CleanUp;
 					}
@@ -997,7 +997,7 @@ BOOL GetTcp6Sessions(_In_ DWORD ProcessId, _Out_ BOOL *bRDPEnabled) {
 					internal_printf("%-18s%s\n", "    State:", "ESTABLISHED");
 					
 					_RtlIpv6AddressToStringW RtlIpv6AddressToStringW = (_RtlIpv6AddressToStringW)
-						GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlIpv6AddressToStringW");
+						KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlIpv6AddressToStringW");
 					if (RtlIpv6AddressToStringW == NULL) {
 						goto CleanUp;
 					}
@@ -1064,14 +1064,14 @@ VOID go()
 	DWORD SessionID;
 	
 	_RtlInitUnicodeString RtlInitUnicodeString = (_RtlInitUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
 	if (RtlInitUnicodeString == NULL) {
 		BeaconPrintf(CALLBACK_ERROR, "GetProcAddress failed.");
 		return;
 	}
 
 	_RtlEqualUnicodeString RtlEqualUnicodeString = (_RtlEqualUnicodeString)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlEqualUnicodeString");
 	if (RtlEqualUnicodeString == NULL) {
 		BeaconPrintf(CALLBACK_ERROR, "GetProcAddress failed.");
 		return;
@@ -1079,7 +1079,7 @@ VOID go()
 
 #if defined(WOW64)
 	_RtlWow64EnableFsRedirectionEx RtlWow64EnableFsRedirectionEx = (_RtlWow64EnableFsRedirectionEx)
-		GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlWow64EnableFsRedirectionEx");
+		KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("ntdll.dll"), "RtlWow64EnableFsRedirectionEx");
 	if (RtlWow64EnableFsRedirectionEx == NULL) {
 		BeaconPrintf(CALLBACK_ERROR, "GetProcAddress failed.");
 		return;

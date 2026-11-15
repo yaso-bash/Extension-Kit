@@ -93,7 +93,7 @@ void bofstop()
     DWORD i;
     for(i = 0; i < loadedLibrariesCount; i++)
     {
-        FreeLibrary(loadedLibraries[i].hMod);
+        KERNEL32$FreeLibrary(loadedLibraries[i].hMod);
     }
 #endif
 	return;
