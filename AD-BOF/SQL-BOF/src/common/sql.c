@@ -248,55 +248,61 @@ char *GetSingleResult(SQLHSTMT stmt, BOOL hasHeader) {
 BOOL PrintQueryResults(SQLHSTMT stmt, BOOL hasHeader) {
   SQLSMALLINT columns;
   SQLRETURN ret;
-
-  // Get the number of columns in the result set
-  ret = ODBC32$SQLNumResultCols(stmt, &columns);
-  if (!SQL_SUCCEEDED(ret)) {
-    internal_printf("Error retrieving column count\n");
-    return FALSE;
-  }
-
   SQLCHAR buffer[1024];
   SQLSMALLINT columnNameLength, dataType, decimalDigits, nullable;
   SQLULEN columnSize;
-  int totalLength = 0;
+  BOOL firstResultSet = TRUE;
 
-  // Print column headers
-  if (hasHeader) {
-    for (SQLSMALLINT i = 1; i <= columns; i++) {
-      ret = ODBC32$SQLDescribeCol(stmt, i, buffer, sizeof(buffer), &columnNameLength, &dataType, &columnSize, &decimalDigits, &nullable);
-      if (!SQL_SUCCEEDED(ret)) {
-        internal_printf("Error retrieving column information.\n");
-        return FALSE;
-      }
-      internal_printf("%s | ", buffer);
-      totalLength += columnNameLength + 3;
+  do {
+    ret = ODBC32$SQLNumResultCols(stmt, &columns);
+    if (!SQL_SUCCEEDED(ret) || columns == 0) {
+      goto NEXT;
     }
 
-    internal_printf("\n");
-    for (int i = 0; i < totalLength; i++) {
-      internal_printf("-");
+    if (!firstResultSet) {
+      internal_printf("\n");
     }
-    internal_printf("\n");
-  }
+    firstResultSet = FALSE;
 
-  // Iterate over each row
-  while (SQL_SUCCEEDED(ret = ODBC32$SQLFetch(stmt))) {
-    // Iterate over each column
-    for (SQLSMALLINT i = 1; i <= columns; i++) {
-      SQLLEN indicator;
-      // Retrieve column data
-      ret = ODBC32$SQLGetData(stmt, i, SQL_C_CHAR, buffer, sizeof(buffer),
-                              &indicator);
-      if (SQL_SUCCEEDED(ret)) {
-        // Print column data
-        if (indicator == SQL_NULL_DATA)
-          MSVCRT$strcpy((char *)buffer, "");
+    int totalLength = 0;
+
+    if (hasHeader) {
+      for (SQLSMALLINT i = 1; i <= columns; i++) {
+        ret = ODBC32$SQLDescribeCol(stmt, i, buffer, sizeof(buffer), &columnNameLength, &dataType, &columnSize, &decimalDigits, &nullable);
+        if (!SQL_SUCCEEDED(ret)) {
+          internal_printf("Error retrieving column information.\n");
+          return FALSE;
+        }
         internal_printf("%s | ", buffer);
+        totalLength += columnNameLength + 3;
       }
+
+      internal_printf("\n");
+      for (int i = 0; i < totalLength; i++) {
+        internal_printf("-");
+      }
+      internal_printf("\n");
     }
-    internal_printf("\n");
-  }
+
+    while (SQL_SUCCEEDED(ret = ODBC32$SQLFetch(stmt))) {
+      for (SQLSMALLINT i = 1; i <= columns; i++) {
+        SQLLEN indicator;
+        ret = ODBC32$SQLGetData(stmt, i, SQL_C_CHAR, buffer, sizeof(buffer),
+                                &indicator);
+        if (SQL_SUCCEEDED(ret)) {
+          if (indicator == SQL_NULL_DATA)
+            MSVCRT$strcpy((char *)buffer, "");
+          internal_printf("%s | ", buffer);
+        }
+      }
+      internal_printf("\n");
+    }
+
+NEXT:
+    ret = ODBC32$SQLMoreResults(stmt);
+  } while (ret == SQL_SUCCESS || ret == SQL_SUCCESS_WITH_INFO);
+
+  return TRUE;
 }
 
 SQLHDBC ConnectToSqlServerAuth(SQLHENV *env, char *server, char *dbName, char *user, char *password) {

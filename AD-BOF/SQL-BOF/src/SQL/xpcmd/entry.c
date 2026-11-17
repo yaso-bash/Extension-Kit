@@ -95,7 +95,7 @@ void ExecuteXpCmd(char *server, char *database, char *link, char *impersonate, c
       goto END;
     }
 
-    internal_printf("[*] Command executed (Output not returned for linked server cmd execution)\n");
+    PrintQueryResults(stmt, TRUE);
   }
 
 END:
